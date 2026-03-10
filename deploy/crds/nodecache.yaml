@@ -1,0 +1,105 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: nodecaches.layercast.io
+spec:
+  group: layercast.io
+  names:
+    categories: []
+    kind: NodeCache
+    plural: nodecaches
+    shortNames: []
+    singular: nodecache
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.nodeName
+      name: Node
+      type: string
+    - jsonPath: .spec.podIP
+      name: IP
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for NodeCacheSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              NodeCache represents the state of a layercast instance on a single node.
+
+              Spec is written once at boot (identity, ports). Status is updated as
+              model peers are registered, using the status subresource for cheap
+              partial writes.
+
+              ```text
+               ┌──────────────────────────────────────┐
+               │  NodeCache: node-worker-3            │
+               │  ownerRef → layercast-daemon-xxxx    │
+               ├──────────────────────────────────────┤
+               │ spec (stable after boot):            │
+               │   nodeName, podIP, nixlControlPort   │
+               ├──────────────────────────────────────┤
+               │ status (updated on peer events):     │
+               │   modelPeers: [{agent, model, ...}]  │
+               └──────────────────────────────────────┘
+              ```
+            properties:
+              nixl_control_port:
+                format: uint16
+                maximum: 65535.0
+                minimum: 0.0
+                type: integer
+              node_name:
+                type: string
+              pod_ip:
+                type: string
+            required:
+            - nixl_control_port
+            - node_name
+            - pod_ip
+            type: object
+          status:
+            nullable: true
+            properties:
+              compile_cache_namespace:
+                description: |-
+                  Compile cache namespace this node can serve (e.g. "H100-SXM5:sha256:abc:meta-llama/70b").
+                  Peers with the same namespace can share torch.compile artifacts.
+                nullable: true
+                type: string
+              model_peers:
+                default: []
+                description: Model peer metadata relayed from local vLLM pods.
+                items:
+                  description: |-
+                    Lightweight pointer stored in NodeCache CRD status.
+
+                    The file list is intentionally omitted: it's deterministic given
+                    (model, tp_rank) and already cached locally via FileListCache.
+                    Keeping the CRD lean lets us add new fields (like compile cache
+                    namespace) without bloating the object.
+                  properties:
+                    agent_name:
+                      type: string
+                    model:
+                      type: string
+                    tp_rank:
+                      format: uint32
+                      minimum: 0.0
+                      type: integer
+                  required:
+                  - agent_name
+                  - model
+                  - tp_rank
+                  type: object
+                type: array
+            type: object
+        required:
+        - spec
+        title: NodeCache
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

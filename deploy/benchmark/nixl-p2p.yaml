@@ -1,0 +1,380 @@
+# Benchmark scenario: NIXL GPUDirect P2P weight transfer.
+#
+# Two pods:
+#   - seed: loads model from NFS (fast), publishes NIXL VRAM metadata
+#   - consumer: loads weights via NIXL GPUDirect from seed's VRAM
+#
+# The seed uses the shared NFS PVC so it starts quickly (no HF download).
+# We only benchmark the consumer's time-to-ready.
+#
+# Substitution vars (via envsubst in benchmark.sh):
+#   ${BENCH_MODEL}      - HF model ID (e.g. "Qwen/Qwen2.5-32B")
+#   ${BENCH_MODEL_PATH} - Filesystem path component
+#
+# Images set via kustomize (see deploy/benchmark/kustomization.yaml).
+
+---
+# Seed: loads from NFS, publishes NIXL VRAM metadata for consumers.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bench-nixl-seed
+  namespace: layercast
+  labels:
+    app: bench
+    bench/scenario: nixl-seed
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      bench/scenario: nixl-seed
+  template:
+    metadata:
+      labels:
+        app: bench
+        bench/scenario: nixl-seed
+    spec:
+      serviceAccountName: model-mesh
+      containers:
+        - name: model-mesh
+          image: model-mesh:latest
+          imagePullPolicy: Always
+          securityContext:
+            runAsUser: 2000
+            capabilities:
+              add: ["IPC_LOCK"]
+          ports:
+            - containerPort: 7903
+              name: nixl-control
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: HF_UPSTREAM
+              value: https://huggingface.co
+            - name: RUST_LOG
+              value: model_mesh=debug,transport=debug,discovery=debug
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: RUST_BACKTRACE
+              value: "1"
+            - name: IPC_SOCKET_PATH
+              value: /var/run/layercast/daemon.sock
+            - name: NIXL_CONTROL_PORT
+              value: "7903"
+            - name: COMPILE_CACHE_ENABLED
+              value: "true"
+            - name: COMPILE_CACHE_ADDR
+              value: "127.0.0.1:6379"
+            - name: MODEL_NAME
+              value: ${BENCH_MODEL}
+            # Seed is the first node, no peers to wait for.
+            - name: PEER_DISCOVERY_TIMEOUT
+              value: "0"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+          resources:
+            requests:
+              memory: "4Gi"
+              cpu: "2"
+            limits:
+              memory: "8Gi"
+              cpu: "4"
+          volumeMounts:
+            - name: ipc-socket
+              mountPath: /var/run/layercast
+            - name: compile-cache
+              mountPath: /var/cache/layercast/compile-cache
+
+        - name: vllm
+          image: vllm-plugin:latest
+          imagePullPolicy: Always
+          command: ["python", "-m", "vllm.entrypoints.openai.api_server"]
+          args:
+            - --model=${BENCH_MODEL}
+            - --load-format=layercast
+            - --tensor-parallel-size=1
+            - --max-model-len=2048
+            - --gpu-memory-utilization=0.85
+            - --port=8000
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            - name: LAYERCAST_SOCKET
+              value: /var/run/layercast/daemon.sock
+            - name: CUDA_VISIBLE_DEVICES
+              value: "0"
+            - name: FLASHINFER_WORKSPACE_DIR
+              value: /tmp/flashinfer
+            - name: HOME
+              value: /tmp
+            # torch.compile remote cache via sidecar RESP shim
+            - name: TORCHINDUCTOR_FX_GRAPH_REMOTE_CACHE
+              value: "1"
+            - name: TORCHINDUCTOR_REDIS_HOST
+              value: "127.0.0.1"
+            - name: TORCHINDUCTOR_REDIS_PORT
+              value: "6379"
+          securityContext:
+            capabilities:
+              add: ["IPC_LOCK"]
+          resources:
+            requests:
+              memory: "16Gi"
+              cpu: "4"
+              nvidia.com/gpu: 1
+              rdma/ib: 1
+            limits:
+              memory: "32Gi"
+              cpu: "8"
+              nvidia.com/gpu: 1
+              rdma/ib: 1
+          volumeMounts:
+            - name: ipc-socket
+              mountPath: /var/run/layercast
+            - name: shm
+              mountPath: /dev/shm
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+
+      volumes:
+        - name: ipc-socket
+          emptyDir: {}
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Gi
+        - name: compile-cache
+          emptyDir:
+            sizeLimit: 10Gi
+
+---
+# Consumer: discovers seed via NodeCache, loads via NIXL GPUDirect.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bench-nixl-consumer
+  namespace: layercast
+  labels:
+    app: bench
+    bench/scenario: nixl-consumer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      bench/scenario: nixl-consumer
+  template:
+    metadata:
+      labels:
+        app: bench
+        bench/scenario: nixl-consumer
+    spec:
+      serviceAccountName: model-mesh
+      initContainers:
+        - name: wait-for-seed
+          image: curlimages/curl:latest
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for NIXL seed to be ready..."
+              until curl -sf http://bench-nixl-seed.layercast.svc.cluster.local:8000/health; do
+                echo "seed not ready, retrying in 5s..."
+                sleep 5
+              done
+              echo "Seed is ready!"
+      containers:
+        - name: model-mesh
+          image: model-mesh:latest
+          imagePullPolicy: Always
+          securityContext:
+            runAsUser: 2000
+            capabilities:
+              add: ["IPC_LOCK"]
+          ports:
+            - containerPort: 7903
+              name: nixl-control
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: HF_UPSTREAM
+              value: https://huggingface.co
+            - name: RUST_LOG
+              value: model_mesh=debug,transport=debug,discovery=debug
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: RUST_BACKTRACE
+              value: "1"
+            - name: IPC_SOCKET_PATH
+              value: /var/run/layercast/daemon.sock
+            - name: NIXL_CONTROL_PORT
+              value: "7903"
+            - name: COMPILE_CACHE_ENABLED
+              value: "true"
+            - name: COMPILE_CACHE_ADDR
+              value: "127.0.0.1:6379"
+            - name: MODEL_NAME
+              value: ${BENCH_MODEL}
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+          resources:
+            requests:
+              memory: "4Gi"
+              cpu: "2"
+            limits:
+              memory: "8Gi"
+              cpu: "4"
+          volumeMounts:
+            - name: ipc-socket
+              mountPath: /var/run/layercast
+            - name: compile-cache
+              mountPath: /var/cache/layercast/compile-cache
+
+        - name: vllm
+          image: vllm-plugin:latest
+          imagePullPolicy: Always
+          command: ["python", "-m", "vllm.entrypoints.openai.api_server"]
+          args:
+            - --model=${BENCH_MODEL}
+            - --load-format=layercast
+            - --tensor-parallel-size=1
+            - --max-model-len=2048
+            - --gpu-memory-utilization=0.85
+            - --port=8000
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            - name: LAYERCAST_SOCKET
+              value: /var/run/layercast/daemon.sock
+            - name: CUDA_VISIBLE_DEVICES
+              value: "0"
+            - name: FLASHINFER_WORKSPACE_DIR
+              value: /tmp/flashinfer
+            - name: HOME
+              value: /tmp
+            # torch.compile remote cache via sidecar RESP shim
+            - name: TORCHINDUCTOR_FX_GRAPH_REMOTE_CACHE
+              value: "1"
+            - name: TORCHINDUCTOR_REDIS_HOST
+              value: "127.0.0.1"
+            - name: TORCHINDUCTOR_REDIS_PORT
+              value: "6379"
+          securityContext:
+            capabilities:
+              add: ["IPC_LOCK"]
+          resources:
+            requests:
+              memory: "16Gi"
+              cpu: "4"
+              nvidia.com/gpu: 1
+              rdma/ib: 1
+            limits:
+              memory: "32Gi"
+              cpu: "8"
+              nvidia.com/gpu: 1
+              rdma/ib: 1
+          volumeMounts:
+            - name: ipc-socket
+              mountPath: /var/run/layercast
+            - name: shm
+              mountPath: /dev/shm
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+
+      volumes:
+        - name: ipc-socket
+          emptyDir: {}
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Gi
+        - name: compile-cache
+          emptyDir:
+            sizeLimit: 10Gi
+
+---
+# Services for inter-pod communication.
+apiVersion: v1
+kind: Service
+metadata:
+  name: bench-nixl-seed
+  namespace: layercast
+  labels:
+    app: bench
+    bench/scenario: nixl-seed
+spec:
+  selector:
+    bench/scenario: nixl-seed
+  ports:
+    - port: 8000
+      targetPort: 8000
+      name: http
+    - port: 7903
+      targetPort: 7903
+      name: nixl-control
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bench-nixl-consumer
+  namespace: layercast
+  labels:
+    app: bench
+    bench/scenario: nixl-consumer
+spec:
+  clusterIP: None
+  selector:
+    bench/scenario: nixl-consumer
+  ports:
+    - port: 8000
+      targetPort: 8000
+      name: http
+    - port: 7903
+      targetPort: 7903
+      name: nixl-control

@@ -1,0 +1,27 @@
+FROM ghcr.io/llm-d/llm-d-cuda:v0.5.1
+
+# Base image runs as UID 2000; switch to root for package installs
+USER root
+
+ENV VIRTUAL_ENV=/opt/vllm
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+# Upgrade nixl to 0.10.1 (match our nixl-sys Rust bindings).
+# Pin numpy<=2.2 because nixl drags in numpy 2.4 which breaks numba (vllm dep).
+RUN uv pip install --python $VIRTUAL_ENV/bin/python --upgrade "nixl-cu12==0.10.1" "numpy<2.3"
+
+# Install the layercast plugin
+COPY vllm-plugin/ /tmp/vllm-plugin/
+RUN uv pip install --python $VIRTUAL_ENV/bin/python "/tmp/vllm-plugin/" && \
+    rm -rf /tmp/vllm-plugin/
+
+# Smoke test: verify the plugin module imports and proto works
+RUN python -c "from vllm_layercast.plugin import register; print('plugin import OK')" && \
+    python -c "from vllm_layercast.proto import ModelLoaded; \
+               msg = ModelLoaded(agent_name='a', metadata=b'x', model_id='m', files=['f'], tp_rank=0); \
+               d = msg.model_dump(); \
+               assert d['type'] == 'model_loaded', f'bad type: {d}'; \
+               print('proto OK')"
+
+# Switch back to non-root
+USER 2000

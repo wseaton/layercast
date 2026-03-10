@@ -1,0 +1,66 @@
+# Job to pre-populate the NFS PVC with model weights.
+#
+# Downloads the model from HuggingFace to the shared PVC so the
+# NFS benchmark scenario can load from local storage.
+#
+# Substitution vars (via envsubst in benchmark.sh):
+#   ${BENCH_MODEL}      - HF model ID (e.g. "Qwen/Qwen2.5-32B")
+#   ${BENCH_MODEL_PATH} - Filesystem path component (e.g. "Qwen/Qwen2.5-32B")
+#
+# Images set via kustomize (see deploy/benchmark/kustomization.yaml).
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: populate-model
+  namespace: layercast
+  labels:
+    app: bench
+    bench/scenario: populate
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: bench
+        bench/scenario: populate
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: download
+          image: vllm-plugin:latest
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              TARGET="/mnt/shared/benchmark/${BENCH_MODEL_PATH}"
+              if [ -f "${TARGET}/config.json" ]; then
+                echo "Model already exists at ${TARGET}, skipping download"
+                exit 0
+              fi
+              echo "Downloading ${BENCH_MODEL} to ${TARGET}..."
+              mkdir -p "${TARGET}"
+              huggingface-cli download "${BENCH_MODEL}" \
+                --local-dir "${TARGET}" \
+                --include "*.safetensors" "*.json" "tokenizer*"
+              echo "Download complete."
+              ls -lh "${TARGET}"
+          env:
+            - name: HOME
+              value: /tmp
+          resources:
+            requests:
+              memory: "4Gi"
+              cpu: "2"
+            limits:
+              memory: "8Gi"
+              cpu: "4"
+          volumeMounts:
+            - name: shared-cache
+              mountPath: /mnt/shared
+      volumes:
+        - name: shared-cache
+          persistentVolumeClaim:
+            claimName: bench-shared-cache

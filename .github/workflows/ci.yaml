@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust lint & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all --benches --tests --examples --all-features -- -D warnings
+      - run: cargo test --workspace
+
+  python:
+    name: Python lint & test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: vllm-plugin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v4
+      - run: uv sync --dev
+      - run: uv run ruff format --check src/ tests/
+      - run: uv run ruff check src/ tests/
+      - run: uvx ty check
+      - run: uv run pytest tests/ -v
+
+  crd-check:
+    name: CRD staleness check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify CRD is up to date
+        run: |
+          cargo run -p discovery --bin crd-gen > /tmp/generated-crd.yaml
+          diff /tmp/generated-crd.yaml deploy/crds/nodecache.yaml || \
+            (echo "::error::CRD is stale. Run 'just crd-gen' and commit the result." && exit 1)

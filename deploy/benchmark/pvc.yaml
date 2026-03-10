@@ -1,0 +1,17 @@
+# Shared RWX PVC for benchmark scenarios (NFS cached + NIXL seed).
+#
+# Separated from scenario manifests so it persists across scenarios.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: bench-shared-cache
+  namespace: layercast
+  labels:
+    app: bench
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: shared-vast
+  resources:
+    requests:
+      storage: 200Gi

@@ -1,0 +1,28 @@
+# NIXL GPUDirect P2P e2e test.
+#
+# Deploys model-mesh daemon + vLLM with layercast plugin.
+# Pod-0 loads from HF (seeds). Pod-1 loads via NIXL GPUDirect from pod-0's GPU.
+#
+# Usage:
+#   kubectl apply -k deploy/nixl-e2e/
+#   ./scripts/test-nixl-e2e.sh
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: layercast
+
+resources:
+  - namespace.yaml
+  - crd.yaml
+  - rbac.yaml
+  - services.yaml
+  - vllm.yaml
+
+images:
+  - name: model-mesh
+    newName: ghcr.io/wseaton/layercast
+    newTag: model-mesh-v25
+  - name: vllm-plugin
+    newName: ghcr.io/wseaton/layercast
+    newTag: vllm-plugin-v24

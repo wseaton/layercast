@@ -1,0 +1,33 @@
+# Layercast remote build on Linux (via podman)
+#
+# Personal/infra details live in .env.local (gitignored).
+# Source it before running:  set -a && source .env.local && set +a
+#
+# Usage: dagrun run model-mesh-build
+
+# Sync source to remote (excludes target dir)
+sync:
+    rsync -az --delete --exclude target --exclude .git -e ssh ${LOCAL_SRC} ${BUILD_HOST}:${BUILD_WORKDIR}/
+
+# Build model-mesh production image
+# /var/tmp is on root (70GB, tight); redirect podman temp to /home
+# @ssh ${BUILD_HOST} workdir=${BUILD_WORKDIR}
+# @timeout 20m
+model-mesh-build: sync
+    export TMPDIR=${PODMAN_TMPDIR} && podman build -f Containerfile.model-mesh -t ${REGISTRY}:${MESH_TAG} .
+
+# Push model-mesh image to registry
+# @ssh ${BUILD_HOST}
+model-mesh-push: model-mesh-build
+    podman push ${REGISTRY}:${MESH_TAG}
+
+# Build vLLM + layercast plugin test image (based on llm-d)
+# @ssh ${BUILD_HOST} workdir=${BUILD_WORKDIR}
+# @timeout 20m
+vllm-plugin-build: sync
+    export TMPDIR=${PODMAN_TMPDIR} && podman build -f Containerfile.vllm-plugin -t ${REGISTRY}:${VLLM_TAG} .
+
+# Push vLLM plugin image to registry
+# @ssh ${BUILD_HOST}
+vllm-plugin-push: vllm-plugin-build
+    podman push ${REGISTRY}:${VLLM_TAG}

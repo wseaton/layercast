@@ -1,0 +1,24 @@
+# Benchmark image references.
+#
+# Scenario YAMLs are applied individually by scripts/benchmark.sh (not as a
+# kustomization bundle), so only pvc.yaml is listed as a resource. The images
+# transformer is the important part: it rewrites the generic placeholder names
+# (model-mesh:latest, vllm-plugin:latest) to real registry/tag values.
+#
+# Usage:
+#   kustomize build deploy/benchmark/ | kubectl apply -f -
+#   # or let benchmark.sh handle it (see scripts/benchmark.sh)
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - pvc.yaml
+
+images:
+  - name: model-mesh
+    newName: ghcr.io/wseaton/layercast
+    newTag: model-mesh-v25
+  - name: vllm-plugin
+    newName: ghcr.io/wseaton/layercast
+    newTag: vllm-plugin-v24

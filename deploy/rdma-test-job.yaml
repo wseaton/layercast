@@ -1,0 +1,173 @@
+# RDMA transport test job.
+#
+# Runs the transport crate's RDMA test suite against real RDMA hardware.
+# The entrypoint auto-detects existing RDMA devices; falls back to SoftRoCE
+# if none are found (e.g. local dev clusters).
+#
+# Prerequisites:
+#   - Build and push the test image:
+#       podman build -f Containerfile.rdma-test -t ${REGISTRY}:${TAG} .
+#       podman push ${REGISTRY}:${TAG}
+#
+# Apply (use kustomize to set the actual image):
+#   kubectl apply -f deploy/rdma-test-job.yaml
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: layercast
+  labels:
+    app.kubernetes.io/part-of: layercast
+
+---
+# Single-pod job: runs all RDMA transport tests (loopback).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rdma-transport-test
+  namespace: layercast
+  labels:
+    app: rdma-transport-test
+    app.kubernetes.io/part-of: layercast
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: rdma-transport-test
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: rdma-test
+          image: rdma-test:latest
+          imagePullPolicy: Always
+          env:
+            - name: RUST_LOG
+              value: transport=debug
+            - name: RUST_BACKTRACE
+              value: "1"
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+              rdma/ib: 1
+            limits:
+              memory: "2Gi"
+              cpu: "2"
+              rdma/ib: 1
+
+---
+# Two-pod test: server and client in separate pods for cross-pod RDMA.
+# The server pod starts first, the client connects to it.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: rdma-test-server
+  namespace: layercast
+  labels:
+    app: rdma-test-server
+    app.kubernetes.io/part-of: layercast
+spec:
+  clusterIP: None
+  selector:
+    app: rdma-test-server
+  ports:
+    - port: 9876
+      name: rdma-handshake
+      protocol: TCP
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rdma-test-server
+  namespace: layercast
+  labels:
+    app: rdma-test-server
+    app.kubernetes.io/part-of: layercast
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: rdma-test-server
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: rdma-server
+          image: rdma-test:latest
+          imagePullPolicy: Always
+          command: ["/usr/local/bin/run-rdma-tests.sh"]
+          args: ["--test-threads=1", "server"]
+          env:
+            - name: RDMA_ROLE
+              value: server
+            - name: RDMA_LISTEN_PORT
+              value: "9876"
+            - name: RUST_LOG
+              value: transport=debug
+            - name: RUST_BACKTRACE
+              value: "1"
+          ports:
+            - containerPort: 9876
+              name: rdma-handshake
+              protocol: TCP
+            - containerPort: 9877
+              name: done-signal
+              protocol: TCP
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+              rdma/ib: 1
+            limits:
+              memory: "2Gi"
+              cpu: "2"
+              rdma/ib: 1
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rdma-test-client
+  namespace: layercast
+  labels:
+    app: rdma-test-client
+    app.kubernetes.io/part-of: layercast
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: rdma-test-client
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: rdma-client
+          image: rdma-test:latest
+          imagePullPolicy: Always
+          command: ["/usr/local/bin/run-rdma-tests.sh"]
+          args: ["--test-threads=1", "client"]
+          env:
+            - name: RDMA_ROLE
+              value: client
+            - name: RDMA_SERVER_ADDR
+              value: rdma-test-server.layercast.svc.cluster.local:9876
+            - name: RUST_LOG
+              value: transport=debug
+            - name: RUST_BACKTRACE
+              value: "1"
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+              rdma/ib: 1
+            limits:
+              memory: "2Gi"
+              cpu: "2"
+              rdma/ib: 1

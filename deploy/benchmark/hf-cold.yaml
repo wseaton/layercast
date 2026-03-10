@@ -1,0 +1,84 @@
+# Benchmark scenario: cold model load from HuggingFace.
+#
+# Single vLLM pod with --load-format=auto (no layercast sidecar).
+# HF_HOME points at an emptyDir to guarantee a fully cold download.
+#
+# Substitution vars (via envsubst in benchmark.sh):
+#   ${BENCH_MODEL}  - HF model ID (e.g. "Qwen/Qwen2.5-32B")
+#
+# Images set via kustomize (see deploy/benchmark/kustomization.yaml).
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bench-hf-cold
+  namespace: layercast
+  labels:
+    app: bench
+    bench/scenario: hf-cold
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      bench/scenario: hf-cold
+  template:
+    metadata:
+      labels:
+        app: bench
+        bench/scenario: hf-cold
+    spec:
+      containers:
+        - name: vllm
+          image: vllm-plugin:latest
+          command: ["python", "-m", "vllm.entrypoints.openai.api_server"]
+          args:
+            - --model=${BENCH_MODEL}
+            - --load-format=auto
+            - --tensor-parallel-size=1
+            - --max-model-len=2048
+            - --gpu-memory-utilization=0.85
+            - --port=8000
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            - name: HF_HOME
+              value: /tmp/hf_home
+            - name: CUDA_VISIBLE_DEVICES
+              value: "0"
+            - name: FLASHINFER_WORKSPACE_DIR
+              value: /tmp/flashinfer
+            - name: HOME
+              value: /tmp
+          securityContext:
+            capabilities:
+              add: ["IPC_LOCK"]
+          resources:
+            requests:
+              memory: "16Gi"
+              cpu: "4"
+              nvidia.com/gpu: 1
+            limits:
+              memory: "32Gi"
+              cpu: "8"
+              nvidia.com/gpu: 1
+          volumeMounts:
+            - name: hf-cache
+              mountPath: /tmp/hf_home
+            - name: shm
+              mountPath: /dev/shm
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+      volumes:
+        - name: hf-cache
+          emptyDir:
+            sizeLimit: 100Gi
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Gi

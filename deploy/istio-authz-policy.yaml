@@ -1,0 +1,21 @@
+# Istio AuthorizationPolicy for model-mesh.
+#
+# Port 8081 (NIXL metadata exchange): only layercast service accounts.
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: model-mesh-internal
+  namespace: layercast
+spec:
+  selector:
+    matchLabels:
+      app: model-mesh
+  action: ALLOW
+  rules:
+    - to:
+        - operation:
+            ports: ["8081"]
+      from:
+        - source:
+            principals: ["cluster.local/ns/layercast/sa/default"]

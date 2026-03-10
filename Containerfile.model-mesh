@@ -1,0 +1,45 @@
+FROM registry.access.redhat.com/ubi9/ubi:latest AS builder
+
+RUN dnf install -y \
+    gcc \
+    openssl-devel \
+    perl \
+    make \
+    && dnf clean all
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /build
+
+# Cache deps: copy manifests first
+COPY Cargo.toml Cargo.lock ./
+COPY crates/discovery/Cargo.toml crates/discovery/Cargo.toml
+COPY crates/model-mesh/Cargo.toml crates/model-mesh/Cargo.toml
+
+RUN for crate in discovery model-mesh; do \
+    mkdir -p crates/$crate/src && echo "" > crates/$crate/src/lib.rs; \
+    done && \
+    echo "fn main() {}" > crates/model-mesh/src/main.rs
+
+# Pre-fetch deps
+RUN cargo build -p model-mesh --release 2>/dev/null || true
+
+# Copy real source and build
+COPY crates/ crates/
+RUN touch crates/*/src/*.rs
+RUN cargo build -p model-mesh --release
+
+FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
+
+COPY --from=builder /build/target/release/model-mesh /usr/local/bin/model-mesh
+
+# Create IPC socket and compile cache directories (writable by non-root UID 2000)
+RUN mkdir -p /var/run/layercast /var/cache/layercast/compile-cache && \
+    chown -R 2000:0 /var/run/layercast /var/cache/layercast
+
+USER 2000
+
+EXPOSE 8081
+
+ENTRYPOINT ["model-mesh"]

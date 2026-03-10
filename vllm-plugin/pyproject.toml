@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vllm-layercast"
+version = "0.1.0"
+description = "Layercast P2P model loading plugin for vLLM"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+dependencies = [
+    "msgpack>=1.0",
+    "pydantic>=2.0",
+    "structlog>=24.0",
+]
+
+[project.optional-dependencies]
+nixl = ["nixl"]
+dev = ["pytest", "pytest-asyncio"]
+
+[project.entry-points."vllm.general_plugins"]
+layercast = "vllm_layercast.plugin:register"
+
+[tool.ty.environment]
+python-version = "3.12"
+
+[tool.ty.analysis]
+# GPU/ML deps not installable on dev machines (need CUDA, etc.)
+allowed-unresolved-imports = [
+    "torch.**",
+    "torch",
+    "triton.**",
+    "triton",
+    "vllm.**",
+    "nixl.**",
+]

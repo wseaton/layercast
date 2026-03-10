@@ -1,0 +1,27 @@
+[package]
+name = "discovery"
+version = "0.1.2-rc1"
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
+schemars = { workspace = true }
+serde_yaml = "0.9"
+futures = { workspace = true }
+rand = { workspace = true }
+
+[[bin]]
+name = "crd-gen"
+path = "src/bin/crd_gen.rs"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber = { workspace = true }
