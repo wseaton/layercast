@@ -1,4 +1,4 @@
-# ServiceAccount for model-mesh pods to interact with NodeCache CRDs.
+# ServiceAccount for model-mesh pods to interact with PodCache CRDs.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -7,7 +7,7 @@ metadata:
     app.kubernetes.io/part-of: layercast
 
 ---
-# Role granting access to NodeCache CRDs and pod reads (for ownerRef UID lookup).
+# Role granting access to PodCache CRDs and pod reads (for ownerRef UID lookup).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -16,7 +16,7 @@ metadata:
     app.kubernetes.io/part-of: layercast
 rules:
   - apiGroups: ["layercast.io"]
-    resources: ["nodecaches", "nodecaches/status"]
+    resources: ["podcaches", "podcaches/status"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]
   - apiGroups: [""]
     resources: ["pods"]

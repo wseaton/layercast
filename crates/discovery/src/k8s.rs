@@ -12,7 +12,7 @@ use kube::{Client, ResourceExt};
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, info, warn};
 
-use crate::crd::{ModelPeerEntry, NodeCache, NodeCacheSpec, NodeCacheStatus};
+use crate::crd::{ModelPeerEntry, PodCache, PodCacheSpec, PodCacheStatus};
 use crate::peer_discovery::{CompileCachePeer, ModelPeer};
 
 /// Configuration for K8s-native peer discovery.
@@ -28,12 +28,12 @@ pub struct K8sDiscoveryConfig {
     pub nixl_control_port: u16,
 }
 
-/// Kubernetes-native peer discovery using NodeCache CRDs and kube-rs reflectors.
+/// Kubernetes-native peer discovery using PodCache CRDs and kube-rs reflectors.
 ///
 /// ```text
 ///  ┌────────────────────────────────┐
 ///  │        API Server              │
-///  │  NodeCache objects (namespace) │
+///  │  PodCache objects (namespace) │
 ///  └──────────┬─────────────────────┘
 ///             │ watch
 ///             ▼
@@ -44,9 +44,9 @@ pub struct K8sDiscoveryConfig {
 ///  └────────────────────────────────┘
 /// ```
 ///
-/// On startup: creates own NodeCache CR with ownerReference to the daemon Pod
+/// On startup: creates own PodCache CR with ownerReference to the daemon Pod
 /// (k8s GC deletes it when the pod dies). Starts a reflector to watch all
-/// NodeCache objects in the namespace.
+/// PodCache objects in the namespace.
 ///
 /// Queries (find_model_peers) read from the in-memory reflector store,
 /// never hitting the API server.
@@ -59,8 +59,8 @@ const STATUS_DEBOUNCE: Duration = Duration::from_millis(100);
 
 pub struct K8sDiscovery {
     config: K8sDiscoveryConfig,
-    node_cache_store: reflector::Store<NodeCache>,
-    own_status: Arc<Mutex<NodeCacheStatus>>,
+    pod_cache_store: reflector::Store<PodCache>,
+    own_status: Arc<Mutex<PodCacheStatus>>,
     /// Wakes the background status patcher when own_status is dirty.
     status_dirty: Arc<Notify>,
     _handles: Vec<tokio::task::JoinHandle<()>>,
@@ -69,7 +69,7 @@ pub struct K8sDiscovery {
 impl K8sDiscovery {
     /// Start the K8s discovery backend.
     ///
-    /// Creates the NodeCache CR, starts the reflector, and returns a ready
+    /// Creates the PodCache CR, starts the reflector, and returns a ready
     /// K8sDiscovery that implements PeerDiscovery.
     pub async fn start(config: K8sDiscoveryConfig) -> Result<Self> {
         let client = Client::try_default()
@@ -89,13 +89,13 @@ impl K8sDiscovery {
             .context("own pod has no UID")?
             .clone();
 
-        // Create or update our NodeCache CR via server-side apply.
+        // Create or update our PodCache CR via server-side apply.
         // Keyed by pod name (not node name) so multiple daemons on the same
         // node each get their own CR instead of clobbering each other.
         let cr_name = format!("pod-{}", config.pod_name);
-        let nc_api: Api<NodeCache> = Api::namespaced(client.clone(), &config.pod_namespace);
+        let nc_api: Api<PodCache> = Api::namespaced(client.clone(), &config.pod_namespace);
 
-        let nc = NodeCache {
+        let nc = PodCache {
             metadata: ObjectMeta {
                 name: Some(cr_name.clone()),
                 namespace: Some(config.pod_namespace.clone()),
@@ -109,7 +109,7 @@ impl K8sDiscovery {
                 }]),
                 ..Default::default()
             },
-            spec: NodeCacheSpec {
+            spec: PodCacheSpec {
                 node_name: config.node_name.clone(),
                 pod_ip: config.pod_ip.clone(),
                 nixl_control_port: config.nixl_control_port,
@@ -124,16 +124,16 @@ impl K8sDiscovery {
                 &Patch::Apply(nc),
             )
             .await
-            .context("failed to create/update own NodeCache")?;
+            .context("failed to create/update own PodCache")?;
 
         info!(
             cr_name = %cr_name,
             node_name = %config.node_name,
             pod_ip = %config.pod_ip,
-            "created own NodeCache CR"
+            "created own PodCache CR"
         );
 
-        // Start NodeCache reflector
+        // Start PodCache reflector
         let (nc_store, nc_writer) = reflector::store();
         let nc_watcher = watcher(nc_api.clone(), watcher::Config::default());
         let nc_stream = reflector(nc_writer, nc_watcher).applied_objects();
@@ -146,17 +146,17 @@ impl K8sDiscovery {
                         debug!(
                             name = nc.name_any(),
                             node = %nc.spec.node_name,
-                            "NodeCache updated in reflector store"
+                            "PodCache updated in reflector store"
                         );
                     }
                     Err(e) => {
-                        warn!(error = %e, "NodeCache watcher error (will retry)");
+                        warn!(error = %e, "PodCache watcher error (will retry)");
                     }
                 }
             }
         });
 
-        let own_status = Arc::new(Mutex::new(NodeCacheStatus::default()));
+        let own_status = Arc::new(Mutex::new(PodCacheStatus::default()));
         let status_dirty = Arc::new(Notify::new());
 
         // Background task: waits for status_dirty notifications, debounces,
@@ -173,7 +173,7 @@ impl K8sDiscovery {
                 tokio::time::sleep(STATUS_DEBOUNCE).await;
 
                 let status_snapshot = flush_status.lock().await.clone();
-                let nc_api: Api<NodeCache> = Api::namespaced(flush_client.clone(), &flush_ns);
+                let nc_api: Api<PodCache> = Api::namespaced(flush_client.clone(), &flush_ns);
                 let patch = serde_json::json!({ "status": status_snapshot });
                 if let Err(e) = nc_api
                     .patch_status(&flush_cr, &PatchParams::default(), &Patch::Merge(patch))
@@ -188,7 +188,7 @@ impl K8sDiscovery {
 
         Ok(Self {
             config,
-            node_cache_store: nc_store,
+            pod_cache_store: nc_store,
             own_status,
             status_dirty,
             _handles: vec![nc_handle, flush_handle],
@@ -199,7 +199,7 @@ impl K8sDiscovery {
 #[async_trait::async_trait]
 impl crate::PeerDiscovery for K8sDiscovery {
     async fn find_model_peers(&self, repo_id: &str, tp_rank: u32) -> Vec<ModelPeer> {
-        let nodes: Vec<Arc<NodeCache>> = self.node_cache_store.state();
+        let nodes: Vec<Arc<PodCache>> = self.pod_cache_store.state();
         let mut peers = Vec::new();
 
         debug!(
@@ -282,7 +282,7 @@ impl crate::PeerDiscovery for K8sDiscovery {
     }
 
     async fn live_nodes(&self) -> Vec<String> {
-        self.node_cache_store
+        self.pod_cache_store
             .state()
             .iter()
             .map(|nc| nc.spec.node_name.clone())
@@ -294,7 +294,7 @@ impl crate::PeerDiscovery for K8sDiscovery {
     }
 
     async fn find_compile_cache_peers(&self, namespace: &str) -> Vec<CompileCachePeer> {
-        let nodes: Vec<Arc<NodeCache>> = self.node_cache_store.state();
+        let nodes: Vec<Arc<PodCache>> = self.pod_cache_store.state();
         let mut peers = Vec::new();
 
         for nc in &nodes {

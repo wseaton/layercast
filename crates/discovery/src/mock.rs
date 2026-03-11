@@ -186,22 +186,22 @@ mod tests {
     }
 
     #[test]
-    fn nodecache_status_backward_compat() {
-        use crate::crd::NodeCacheStatus;
+    fn podcache_status_backward_compat() {
+        use crate::crd::PodCacheStatus;
 
         // JSON without compile_cache_namespace should deserialize fine (defaults to None)
         let json = r#"{"model_peers": [{"agent_name": "a", "model": "m", "tp_rank": 0}]}"#;
-        let status: NodeCacheStatus = serde_json::from_str(json).unwrap();
+        let status: PodCacheStatus = serde_json::from_str(json).unwrap();
         assert_eq!(status.model_peers.len(), 1);
         assert!(status.compile_cache_namespace.is_none());
 
         // Empty JSON
-        let status: NodeCacheStatus = serde_json::from_str("{}").unwrap();
+        let status: PodCacheStatus = serde_json::from_str("{}").unwrap();
         assert!(status.compile_cache_namespace.is_none());
 
         // With compile_cache_namespace present
         let json = r#"{"model_peers": [], "compile_cache_namespace": "H100:sha256:abc"}"#;
-        let status: NodeCacheStatus = serde_json::from_str(json).unwrap();
+        let status: PodCacheStatus = serde_json::from_str(json).unwrap();
         assert_eq!(
             status.compile_cache_namespace.as_deref(),
             Some("H100:sha256:abc")

@@ -82,7 +82,7 @@ async fn healthz(State(state): State<InternalState>) -> Response {
 ///
 /// Returns the raw NIXL VRAM metadata bytes for a local agent.
 /// Peers call this to fetch the actual metadata after discovering
-/// the lightweight pointer via the NodeCache CRD.
+/// the lightweight pointer via the PodCache CRD.
 async fn get_nixl_vram_metadata(
     State(state): State<InternalState>,
     Path(agent_name): Path<String>,

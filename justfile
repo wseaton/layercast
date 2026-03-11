@@ -29,7 +29,7 @@ check:
 
 # CRDs
 crd-gen:
-    cargo run -p discovery --bin crd-gen > deploy/crds/nodecache.yaml
+    cargo run -p discovery --bin crd-gen > deploy/crds/podcache.yaml
 
 kopium-inferencepool:
     kopium -f deploy/external-crds/inferencepool.yaml --docs > crates/discovery/src/inference_pool.rs
@@ -37,10 +37,10 @@ kopium-inferencepool:
 
 # Benchmark: model load latency across HF, NFS, NIXL
 benchmark *ARGS:
-    ./scripts/benchmark.sh {{ARGS}}
+    ./scripts/benchmark.py {{ARGS}}
 
 benchmark-cleanup:
-    ./scripts/benchmark.sh --cleanup
+    ./scripts/benchmark.py --cleanup
 
 # Python plugin tests
 test-plugin:

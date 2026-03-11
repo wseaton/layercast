@@ -1,13 +1,13 @@
 //! In-memory store for NIXL VRAM metadata blobs.
 //!
-//! NIXL agent metadata is too large for the NodeCache CRD (often >100KB).
+//! NIXL agent metadata is too large for the PodCache CRD (often >100KB).
 //! Instead, the daemon stores metadata here and serves it via HTTP. The CRD
 //! carries a lightweight pointer (model, tp_rank, agent_name).
 //!
 //!   publish flow:  vLLM plugin --IPC--> daemon stores in ModelPeerStore
-//!                                       + advertises pointer via NodeCache CRD
+//!                                       + advertises pointer via PodCache CRD
 //!
-//!   fetch flow:    peer discovers pointer via NodeCache reflector
+//!   fetch flow:    peer discovers pointer via PodCache reflector
 //!                  --> HTTP GET /internal/nixl-vram/{agent_name}
 //!                  --> returns raw metadata bytes
 

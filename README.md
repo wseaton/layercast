@@ -13,7 +13,7 @@ Seed Pod                    Consumer Pods
 │   ↕ IPC          │        │   ↕ IPC          │
 │ model-mesh       │        │ model-mesh       │
 │   ↕ CRD          │        │   ↕ CRD          │
-│ K8s NodeCache    │◄──────►│ K8s NodeCache    │
+│ K8s PodCache    │◄──────►│ K8s PodCache    │
 └──────────────────┘        └──────────────────┘
         │                           │
         └───── NIXL GPUDirect ──────┘
@@ -41,7 +41,7 @@ NIXL consumers load weights 3x faster than NFS. With compile cache hits (65/65),
 
 ```
 crates/
-  discovery/       K8s peer discovery (NodeCache CRD, kube-rs reflectors)
+  discovery/       K8s peer discovery (PodCache CRD, kube-rs reflectors)
   model-mesh/      Sidecar daemon (IPC server, HTTP metadata API, compile cache)
 vllm-plugin/       vLLM plugin (model loader, NIXL agent, checksum verification)
 deploy/
@@ -51,7 +51,7 @@ deploy/
 
 | Crate | Description |
 |-------|-------------|
-| **discovery** | Peer discovery via K8s NodeCache CRD and kube-rs reflectors. Tracks model peers and compile cache namespaces. |
+| **discovery** | Peer discovery via K8s PodCache CRD and kube-rs reflectors. Tracks model peers and compile cache namespaces. |
 | **model-mesh** | IPC daemon for the vLLM plugin. HTTP server for peer metadata exchange, RESP2 shim for torch.compile P2P cache. |
 
 ## Sidecar HTTP API
@@ -137,7 +137,7 @@ cargo test --all
 # Run Python tests
 cd vllm-plugin && uv run pytest tests/ -v
 
-# Generate the NodeCache CRD YAML
+# Generate the PodCache CRD YAML
 cargo run -p discovery --bin crd-gen
 ```
 

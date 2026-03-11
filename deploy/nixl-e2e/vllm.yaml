@@ -1,7 +1,7 @@
 # Two-deployment NIXL E2E test.
 #
 # 1. Deploy vllm-seed first: loads from HF, publishes NIXL VRAM metadata.
-# 2. Deploy vllm-consumer second: discovers seed via K8s NodeCache, loads via NIXL P2P.
+# 2. Deploy vllm-consumer second: discovers seed via K8s PodCache, loads via NIXL P2P.
 #
 # Usage:
 #   kubectl apply -f vllm.yaml -l app.kubernetes.io/component=seed
@@ -185,7 +185,7 @@ spec:
             sizeLimit: 10Gi
 
 ---
-# Consumer: discovers seed via NodeCache, loads weights via NIXL P2P.
+# Consumer: discovers seed via PodCache, loads weights via NIXL P2P.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

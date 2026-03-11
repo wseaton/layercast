@@ -26,7 +26,7 @@ pub struct CompileCachePeer {
 /// Backend-agnostic peer discovery and advertisement.
 ///
 /// Implementations:
-/// - `K8sDiscovery`: production backend using NodeCache CRD + kube-rs reflectors
+/// - `K8sDiscovery`: production backend using PodCache CRD + kube-rs reflectors
 /// - `MockDiscovery`: in-memory backend for tests
 ///
 /// All consumers hold `Arc<dyn PeerDiscovery>` and never know which

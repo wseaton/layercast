@@ -51,5 +51,5 @@ jobs:
       - name: Verify CRD is up to date
         run: |
           cargo run -p discovery --bin crd-gen > /tmp/generated-crd.yaml
-          diff /tmp/generated-crd.yaml deploy/crds/nodecache.yaml || \
+          diff /tmp/generated-crd.yaml deploy/crds/podcache.yaml || \
             (echo "::error::CRD is stale. Run 'just crd-gen' and commit the result." && exit 1)
