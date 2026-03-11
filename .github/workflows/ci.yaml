@@ -38,7 +38,7 @@ jobs:
       - run: uv sync --dev
       - run: uvx ruff format --check src/ tests/
       - run: uvx ruff check src/ tests/
-      - run: uvx ty check
+      - run: uvx ty check --python .venv
       - run: uv run pytest tests/ -v
 
   crd-check:
