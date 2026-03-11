@@ -7,7 +7,7 @@ name = "vllm-layercast"
 version = "0.1.0"
 description = "Layercast P2P model loading plugin for vLLM"
 requires-python = ">=3.10"
-license = "Apache-2.0"
+license = "MIT OR Apache-2.0"
 dependencies = [
     "msgpack>=1.0",
     "pydantic>=2.0",
