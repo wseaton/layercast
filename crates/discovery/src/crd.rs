@@ -109,9 +109,6 @@ mod tests {
     fn crd_generation() {
         use kube::CustomResourceExt;
         let crd = PodCache::crd();
-        assert_eq!(
-            crd.metadata.name.as_deref(),
-            Some("podcaches.layercast.io")
-        );
+        assert_eq!(crd.metadata.name.as_deref(), Some("podcaches.layercast.io"));
     }
 }

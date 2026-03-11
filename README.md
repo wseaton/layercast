@@ -6,18 +6,22 @@ Distributed model weight loading for Kubernetes. Accelerates LLM cold starts by 
 
 A seed pod downloads the model once (from HuggingFace or a shared filesystem). Every subsequent pod pulls weights straight from the seed's GPU memory at ~8 GB/s over InfiniBand. A torch.compile cache propagates between peers so the second consumer onwards skips codegen entirely.
 
-```
-Seed Pod                    Consumer Pods
-┌──────────────────┐        ┌──────────────────┐
-│ vLLM + Plugin    │        │ vLLM + Plugin    │
-│   ↕ IPC          │        │   ↕ IPC          │
-│ model-mesh       │        │ model-mesh       │
-│   ↕ CRD          │        │   ↕ CRD          │
-│ K8s PodCache    │◄──────►│ K8s PodCache    │
-└──────────────────┘        └──────────────────┘
-        │                           │
-        └───── NIXL GPUDirect ──────┘
-              (VRAM → VRAM RDMA)
+```mermaid
+graph TB
+    subgraph seed["Seed Pod"]
+        sv[vLLM + Plugin]
+        sm[model-mesh]
+        sv -- IPC --- sm
+    end
+
+    subgraph consumer["Consumer Pod"]
+        cv[vLLM + Plugin]
+        cm[model-mesh]
+        cv -- IPC --- cm
+    end
+
+    sm -- PodCache CRD --- cm
+    sm <-. "NIXL GPUDirect (VRAM → VRAM RDMA)" .-> cm
 ```
 
 ## Weight loading cascade
@@ -70,12 +74,15 @@ The model-mesh sidecar exposes an HTTP server (default port 8081):
 
 The vLLM plugin communicates with the sidecar over a Unix domain socket using length-prefixed msgpack. Three messages form a per-connection state machine:
 
-```
-    PrepareModel ──► Prepared{files, peers}
-         │
-    ModelLoaded  ──► Ok  (advertise to peers)
-         │
-    ModelUnloaded ──► Ok  (unadvertise, cleanup)
+```mermaid
+stateDiagram-v2
+    [*] --> Connected
+    Connected --> Preparing : PrepareModel
+    Connected --> Connected : PrepareModel fails (error)
+    Preparing --> Ready : ModelLoaded (advertise)
+    Ready --> Connected : ModelUnloaded (cleanup)
+    Ready --> Preparing : PrepareModel (hot-swap)
+    Ready --> [*] : EOF (auto-unadvertise)
 ```
 
 ## Configuration
@@ -84,22 +91,33 @@ The vLLM plugin communicates with the sidecar over a Unix domain socket using le
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `POD_NAME` | *(required)* | Pod name (K8s downward API) |
+| `POD_IP` | *(required)* | Pod IP address (K8s downward API) |
+| `POD_NAMESPACE` | `layercast-system` | Pod namespace (K8s downward API) |
+| `NODE_NAME` | `localhost` | Node name (K8s downward API) |
 | `LISTEN_ADDR` | `0.0.0.0:8081` | HTTP server bind address |
 | `IPC_SOCKET_PATH` | `/var/run/layercast/daemon.sock` | Unix socket for vLLM IPC |
 | `HF_UPSTREAM` | `https://huggingface.co` | HuggingFace Hub URL (file listing) |
+| `NIXL_CONTROL_PORT` | `7903` | TCP port for NIXL metadata exchange |
 | `MODEL_NAME` | *(none)* | Pre-fetch file list at boot (predictive cache) |
 | `PEER_DISCOVERY_TIMEOUT` | `120` | Seconds to poll for peers (0 = skip, for seeds) |
 | `COMPILE_CACHE_ENABLED` | `false` | Enable torch.compile P2P cache |
 | `COMPILE_CACHE_ADDR` | `127.0.0.1:6379` | RESP2 shim listen address |
-| `POD_NAME` | *(required)* | From K8s downward API |
-| `POD_IP` | *(required)* | From K8s downward API |
-| `NODE_NAME` | *(required)* | From K8s downward API |
+| `COMPILE_CACHE_DIR` | `/var/cache/layercast/compile-cache` | On-disk compile cache directory |
+| `COMPILE_CACHE_MAX_MEMORY` | `512MB` | Max memory for in-memory compile cache |
+| `GPU_PRODUCT` | *(auto-detected)* | GPU identifier (e.g. `NVIDIA-H100-SXM5-80GB`) |
+| `IMAGE_DIGEST` | *(none)* | Container image digest for compile cache namespace |
 
 ### vLLM plugin
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LAYERCAST_SOCKET` | `/var/run/layercast/daemon.sock` | Path to sidecar IPC socket |
+| `LAYERCAST_CHECKSUM` | `true` | Verify safetensor checksums after transfer |
+| `LAYERCAST_COALESCE_THRESHOLD` | `1MB` | Coalesce NIXL transfers below this size |
+| `LAYERCAST_NIXL_NUM_THREADS` | `4` | Number of NIXL transfer threads |
+| `LAYERCAST_IB_SL` | `1` | InfiniBand service level |
+| `HF_TOKEN` | *(none)* | HuggingFace token for gated model access |
 
 ## Quick start
 
