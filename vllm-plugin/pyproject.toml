@@ -16,7 +16,9 @@ dependencies = [
 
 [project.optional-dependencies]
 nixl = ["nixl"]
-dev = ["pytest", "pytest-asyncio"]
+
+[dependency-groups]
+dev = ["pytest", "pytest-asyncio", "ruff"]
 
 [project.entry-points."vllm.general_plugins"]
 layercast = "vllm_layercast.plugin:register"
