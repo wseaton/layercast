@@ -1,10 +1,16 @@
-# Layercast
+# layercast
 
-Distributed model weight loading for Kubernetes. Accelerates LLM cold starts by transferring weights directly between GPU VRAM via NIXL GPUDirect RDMA, bypassing disk and CPU entirely.
+[![CI](https://github.com/wseaton/layercast/actions/workflows/ci.yaml/badge.svg)](https://github.com/wseaton/layercast/actions/workflows/ci.yaml)
+[![Container Images](https://github.com/wseaton/layercast/actions/workflows/images.yaml/badge.svg)](https://github.com/wseaton/layercast/actions/workflows/images.yaml)
+[![License: Apache-2.0 OR MIT](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue)](LICENSE-APACHE)
+
+Distributed model weight loading for Kubernetes. Accelerates LLM cold starts by transferring weights directly between GPU VRAM via NIXL GPUDirect RDMA (UCX, UCCL, etc), bypassing disk and CPU entirely.
 
 ## How it works
 
-A seed pod downloads the model once (from HuggingFace or a shared filesystem). Every subsequent pod pulls weights straight from the seed's GPU memory at ~8 GB/s over InfiniBand. A torch.compile cache propagates between peers so the second consumer onwards skips codegen entirely.
+A seed pod downloads the model once (from HuggingFace or a shared filesystem). Every subsequent pod pulls weights straight from the seed's GPU memory at ~8 GB/s over InfiniBand. 
+
+Additionally, we also have infrastrcuture for torch.compile cache propogation between peers, so the second consumer onwards skips codegen entirely. This is done by implementing the remote torch dynamo Redis cache API but backed by cooperative peering.
 
 ```mermaid
 graph TB
@@ -31,15 +37,17 @@ The vLLM plugin tries each source in priority order, falling through on failure:
 1. **NIXL GPUDirect** - VRAM-to-VRAM transfer from a peer pod (~8 GB/s over IB)
 2. **vLLM default** - HuggingFace download or shared filesystem read
 
-## Benchmark results (Qwen2.5-32B, CoreWeave)
+## Benchmark results (Qwen2.5-32B, CoreWeave H100 SXM5)
 
-| Scenario | Time-to-Ready | Weight Load | Method |
-|----------|--------------|-------------|--------|
-| NFS cached (VAST) | 119s | ~119s | NFS read |
-| NIXL consumer | ~92s | 24s @ 8.6 GB/s | GPUDirect RDMA |
-| NIXL + compile cache | ~81s | 25s @ 8.1 GB/s | GPUDirect + cache hits |
+Weight transfer throughput over InfiniBand with NIXL GPUDirect RDMA:
 
-NIXL consumers load weights 3x faster than NFS. With compile cache hits (65/65), total TTR drops another 13%.
+| Metric | Value |
+|--------|-------|
+| Transfer speed | 7.7 - 8.7 GB/s |
+| Weight load (single consumer) | ~26s for 60GB model |
+| Checksum verification | ~35ms |
+
+Measured across multiple consumers pulling from a single seed. Actual time-to-ready depends on vLLM startup, torch.compile, and model config.
 
 ## Project structure
 
