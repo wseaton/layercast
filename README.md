@@ -143,4 +143,4 @@ cargo run -p discovery --bin crd-gen
 
 ## License
 
-Apache-2.0
+Dual-licensed under [Apache 2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option.
