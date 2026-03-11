@@ -8,3 +8,4 @@ target/
 .venv/
 *.pyc
 benchmark-logs/
+.ruff_cache/

@@ -20,9 +20,6 @@ import msgpack
 from pydantic import BaseModel, Field, TypeAdapter
 
 
-# Request messages (client -> daemon)
-
-
 class PrepareModel(BaseModel):
     """Batch: list model files + discover NIXL peers + fetch metadata.
 
@@ -62,9 +59,6 @@ class ModelUnloaded(BaseModel):
 RequestMessage = Union[PrepareModel, ModelLoaded, ModelUnloaded]
 
 
-# Response messages (daemon -> client)
-
-
 class PeerNixlMd(BaseModel):
     agent_name: str
     metadata: bytes
@@ -93,9 +87,6 @@ ResponseMessage = Annotated[
 ]
 
 _response_adapter: TypeAdapter[ResponseMessage] = TypeAdapter(ResponseMessage)
-
-
-# Serialization helpers
 
 
 def encode(msg: RequestMessage) -> bytes:

@@ -51,7 +51,7 @@ from vllm_layercast.nixl_agent import VramNixlAgent, _COALESCE_THRESHOLD  # noqa
 from vllm_layercast.proto import PeerNixlMd  # noqa: E402
 
 # Keep NIXL agents alive for the process lifetime so remote peers can
-# RDMA-read our VRAM. Without this, the agent (and its registered memory)
+# RDMA-read. Without this, the agent (and its registered memory)
 # could be garbage collected when the model loader is no longer referenced.
 _NIXL_AGENTS: dict[int, VramNixlAgent] = {}  # keyed by tp_rank
 
@@ -64,7 +64,7 @@ _BACKEND_KEEPALIVE: tuple[asyncio.AbstractEventLoop, RustSidecarBackend] | None 
 
 
 class LayercastModelLoader(BaseModelLoader):
-    """P2P-aware model loader.
+    """P2P model loader.
 
     Cascade: NIXL -> vLLM default (NFS PVC / HF download).
     """
@@ -199,8 +199,6 @@ class LayercastModelLoader(BaseModelLoader):
         if weight_files:
             self._publish_vram(model, repo_id, revision, weight_files, tp_rank)
         return model
-
-    # Internal: NIXL GPUDirect RDMA load
 
     def _try_nixl_load(
         self,
@@ -438,8 +436,6 @@ class LayercastModelLoader(BaseModelLoader):
         )
         return True
 
-    # Internal: VRAM publication
-
     def _publish_vram(
         self,
         model: nn.Module,
@@ -643,9 +639,6 @@ class LayercastModelLoader(BaseModelLoader):
             self._backend = RustSidecarBackend(socket_path=socket_path)
             await self._backend.start()
         return self._backend
-
-
-# Module-level helpers
 
 
 def _get_tp_rank() -> int:
