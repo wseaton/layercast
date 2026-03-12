@@ -78,6 +78,7 @@ spec:
       labels:
         app: model-mesh
     spec:
+      terminationGracePeriodSeconds: 60
       containers:
         - name: model-mesh
           # Use kustomize images transformer to set the actual registry/tag.
@@ -137,6 +138,18 @@ spec:
             #   TORCHINDUCTOR_FX_GRAPH_REMOTE_CACHE: "1"
             #   TORCHINDUCTOR_REDIS_HOST: "127.0.0.1"
             #   TORCHINDUCTOR_REDIS_PORT: "6379"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8081
+            initialDelaySeconds: 30
+            periodSeconds: 10
           securityContext:
             capabilities:
               add: ["IPC_LOCK"]

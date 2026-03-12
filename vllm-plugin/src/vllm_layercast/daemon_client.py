@@ -52,11 +52,7 @@ class DaemonClient:
 
     async def close(self) -> None:
         """Close the connection."""
-        if self._writer is not None:
-            self._writer.close()
-            await self._writer.wait_closed()
-            self._writer = None
-            self._reader = None
+        await self._reset()
 
     # State machine RPC methods
 
@@ -138,5 +134,25 @@ class DaemonClient:
     async def _roundtrip(
         self, msg: RequestMessage
     ) -> Prepared | Ok | Error | dict[str, object]:
-        await self._send(msg)
-        return await self._recv()
+        """Send a request and receive the response, reconnecting once on socket errors."""
+        try:
+            await self._send(msg)
+            return await self._recv()
+        except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError, OSError) as exc:
+            log.warning("ipc_socket_error", error=str(exc), action="reconnecting")
+            # Tear down the dead connection and retry once
+            await self._reset()
+            await self.connect()
+            await self._send(msg)
+            return await self._recv()
+
+    async def _reset(self) -> None:
+        """Silently tear down the connection (best-effort)."""
+        if self._writer is not None:
+            try:
+                self._writer.close()
+                await self._writer.wait_closed()
+            except OSError:
+                pass
+            self._writer = None
+            self._reader = None

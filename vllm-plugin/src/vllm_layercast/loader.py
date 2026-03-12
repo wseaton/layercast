@@ -12,6 +12,7 @@ import concurrent.futures
 import dataclasses
 import json
 import os
+import threading
 import time
 import urllib.request
 from typing import TYPE_CHECKING
@@ -54,6 +55,7 @@ from vllm_layercast.proto import PeerNixlMd  # noqa: E402
 # RDMA-read. Without this, the agent (and its registered memory)
 # could be garbage collected when the model loader is no longer referenced.
 _NIXL_AGENTS: dict[int, VramNixlAgent] = {}  # keyed by tp_rank
+_NIXL_AGENTS_LOCK = threading.Lock()
 
 # Keep the backend + event loop alive for the process lifetime.
 # Without this, Python GC collects the model loader after load_model()
@@ -156,15 +158,19 @@ class LayercastModelLoader(BaseModelLoader):
             # Overlap NIXL agent + UCX backend init (~3s) with model init (~16s).
             # Both are independent: model init builds the graph on meta device,
             # while NIXL creates UCX workers and endpoints.
-            agent_future = concurrent.futures.ThreadPoolExecutor(1).submit(
-                self._ensure_nixl_agent, tp_rank
-            )
-            model = initialize_model(vllm_config, prefix=prefix)
-            # Collect the agent (will be instant if model init took longer)
-            try:
-                agent_future.result(timeout=30)
-            except Exception as exc:
-                log.error("nixl_agent_init_failed", error=str(exc))
+            with concurrent.futures.ThreadPoolExecutor(1) as executor:
+                agent_future = executor.submit(self._ensure_nixl_agent, tp_rank)
+                model = initialize_model(vllm_config, prefix=prefix)
+                # Collect the agent (will be instant if model init took longer)
+                try:
+                    agent_future.result(timeout=30)
+                except Exception as exc:
+                    log.error("nixl_agent_init_failed", error=str(exc))
+            if self._nixl_agent is None:
+                log.error("nixl_agent_not_initialized_after_init")
+                raise RuntimeError(
+                    "NIXL agent failed to initialize, cannot proceed with GPUDirect load"
+                )
             if self._try_nixl_load(
                 model,
                 repo_id,
@@ -356,7 +362,7 @@ class LayercastModelLoader(BaseModelLoader):
         for name, handle in handles:
             try:
                 agent.wait_transfer(handle)
-            except RuntimeError as exc:
+            except (RuntimeError, TimeoutError) as exc:
                 log.warning("nixl_transfer_failed", tensor=name, error=str(exc))
                 return False
 
@@ -512,7 +518,11 @@ class LayercastModelLoader(BaseModelLoader):
             global _BACKEND_KEEPALIVE  # noqa: PLW0603
             _BACKEND_KEEPALIVE = (loop, backend)
         except Exception as exc:
-            log.warning("publish_nixl_metadata_failed", error=str(exc))
+            log.warning(
+                "publish_nixl_metadata_failed",
+                error=str(exc),
+                impact="this pod will not be discoverable as a NIXL peer",
+            )
 
     # Helpers
 
@@ -619,7 +629,10 @@ class LayercastModelLoader(BaseModelLoader):
         return files
 
     def _ensure_nixl_agent(self, tp_rank: int) -> VramNixlAgent:
-        if self._nixl_agent is None:
+        if self._nixl_agent is not None:
+            return self._nixl_agent
+        with _NIXL_AGENTS_LOCK:
+            # Double-check after acquiring the lock
             if tp_rank in _NIXL_AGENTS:
                 self._nixl_agent = _NIXL_AGENTS[tp_rank]
             else:

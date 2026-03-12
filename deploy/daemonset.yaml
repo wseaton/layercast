@@ -15,6 +15,7 @@ spec:
         app: model-mesh
     spec:
       hostNetwork: true
+      terminationGracePeriodSeconds: 60
       containers:
         - name: model-mesh
           image: model-mesh:dev
@@ -40,6 +41,18 @@ spec:
                   fieldPath: status.podIP
             - name: HF_UPSTREAM
               value: https://huggingface.co
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8081
+            initialDelaySeconds: 30
+            periodSeconds: 10
           resources:
             requests:
               memory: "512Mi"
