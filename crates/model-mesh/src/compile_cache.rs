@@ -43,6 +43,13 @@ use tracing::{debug, error, info, warn};
 
 use crate::resp::{self, RespCommand, RespResponse};
 
+/// Errors that can occur in the compile cache RESP server.
+#[derive(Debug, thiserror::Error)]
+pub enum CompileCacheError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
 // CompileCacheNamespace
 
 /// Strong type wrapping `{gpu_sku}:{image_digest}:{model_name}`.
@@ -370,7 +377,7 @@ impl CompileCacheServer {
         Self { addr, store }
     }
 
-    pub async fn start(self) -> anyhow::Result<JoinHandle<()>> {
+    pub async fn start(self) -> Result<JoinHandle<()>, CompileCacheError> {
         let listener = TcpListener::bind(&self.addr).await?;
         info!(addr = %self.addr, "compile cache RESP server listening");
 
@@ -402,7 +409,7 @@ impl CompileCacheServer {
 async fn handle_connection(
     mut stream: tokio::net::TcpStream,
     store: CompileCacheStore,
-) -> anyhow::Result<()> {
+) -> Result<(), CompileCacheError> {
     let mut buf = BytesMut::with_capacity(4096);
     let mut out = BytesMut::with_capacity(1024);
 

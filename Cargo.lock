@@ -430,7 +430,6 @@ dependencies = [
 name = "discovery"
 version = "0.1.2-rc1"
 dependencies = [
- "anyhow",
  "async-trait",
  "futures",
  "k8s-openapi",

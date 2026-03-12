@@ -2,7 +2,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
@@ -11,6 +10,16 @@ use kube::runtime::{WatchStreamExt, reflector, watcher};
 use kube::{Client, ResourceExt};
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, info, warn};
+
+/// Errors that can occur during K8s discovery initialization.
+#[derive(Debug, thiserror::Error)]
+pub enum DiscoveryError {
+    #[error("kube API error: {0}")]
+    Kube(#[from] kube::Error),
+
+    #[error("own pod has no UID")]
+    PodMissingUid,
+}
 
 use crate::crd::{ModelPeerEntry, PodCache, PodCacheSpec, PodCacheStatus};
 use crate::peer_discovery::{CompileCachePeer, ModelPeer};
@@ -71,22 +80,17 @@ impl K8sDiscovery {
     ///
     /// Creates the PodCache CR, starts the reflector, and returns a ready
     /// K8sDiscovery that implements PeerDiscovery.
-    pub async fn start(config: K8sDiscoveryConfig) -> Result<Self> {
-        let client = Client::try_default()
-            .await
-            .context("failed to create kube client (are we running in-cluster?)")?;
+    pub async fn start(config: K8sDiscoveryConfig) -> Result<Self, DiscoveryError> {
+        let client = Client::try_default().await?;
 
         // Look up own pod for ownerReference UID
         let pods: Api<Pod> = Api::namespaced(client.clone(), &config.pod_namespace);
-        let own_pod = pods
-            .get(&config.pod_name)
-            .await
-            .context("failed to get own pod")?;
+        let own_pod = pods.get(&config.pod_name).await?;
         let pod_uid = own_pod
             .metadata
             .uid
             .as_ref()
-            .context("own pod has no UID")?
+            .ok_or(DiscoveryError::PodMissingUid)?
             .clone();
 
         // Create or update our PodCache CR via server-side apply.
@@ -123,8 +127,7 @@ impl K8sDiscovery {
                 &PatchParams::apply("layercast-daemon").force(),
                 &Patch::Apply(nc),
             )
-            .await
-            .context("failed to create/update own PodCache")?;
+            .await?;
 
         info!(
             cr_name = %cr_name,

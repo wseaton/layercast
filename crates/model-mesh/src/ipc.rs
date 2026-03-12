@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -13,6 +12,34 @@ use tracing::{debug, error, info, warn};
 use discovery::PeerDiscovery;
 
 use crate::nixl_vram_store::ModelPeerStore;
+
+/// Errors that can occur in the IPC server and its supporting operations.
+#[derive(Debug, thiserror::Error)]
+pub enum IpcError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("failed to serialize message: {0}")]
+    Serialize(#[from] rmp_serde::encode::Error),
+
+    #[error("failed to deserialize message: {0}")]
+    Deserialize(#[from] rmp_serde::decode::Error),
+
+    #[error("message too large: {size} bytes (max {max})")]
+    MessageTooLarge { size: u32, max: u32 },
+
+    #[error("HF API request failed: {0}")]
+    HfApi(reqwest::Error),
+
+    #[error("HF API returned {0}")]
+    HfApiStatus(reqwest::StatusCode),
+
+    #[error("failed to parse HF API response: {0}")]
+    HfApiParse(reqwest::Error),
+
+    #[error("IPC server task failed: {0}")]
+    TaskJoin(#[from] tokio::task::JoinError),
+}
 
 // Wire protocol messages
 //
@@ -107,33 +134,24 @@ impl ConnectionState {
 
 // Length-prefixed msgpack helpers
 
-async fn read_message<T: DeserializeOwned>(stream: &mut UnixStream) -> Result<T> {
-    let len = stream
-        .read_u32()
-        .await
-        .context("failed to read message length")?;
+async fn read_message<T: DeserializeOwned>(stream: &mut UnixStream) -> Result<T, IpcError> {
+    let len = stream.read_u32().await?;
     if len > MAX_MESSAGE_SIZE {
-        anyhow::bail!("message too large: {len} bytes (max {MAX_MESSAGE_SIZE})");
+        return Err(IpcError::MessageTooLarge {
+            size: len,
+            max: MAX_MESSAGE_SIZE,
+        });
     }
     let mut buf = vec![0u8; len as usize];
-    stream
-        .read_exact(&mut buf)
-        .await
-        .context("failed to read message body")?;
-    rmp_serde::from_slice(&buf).context("failed to deserialize message")
+    stream.read_exact(&mut buf).await?;
+    Ok(rmp_serde::from_slice(&buf)?)
 }
 
-async fn write_message<T: Serialize>(stream: &mut UnixStream, msg: &T) -> Result<()> {
-    let data = rmp_serde::to_vec_named(msg).context("failed to serialize message")?;
-    stream
-        .write_u32(data.len() as u32)
-        .await
-        .context("failed to write message length")?;
-    stream
-        .write_all(&data)
-        .await
-        .context("failed to write message body")?;
-    stream.flush().await.context("failed to flush stream")?;
+async fn write_message<T: Serialize>(stream: &mut UnixStream, msg: &T) -> Result<(), IpcError> {
+    let data = rmp_serde::to_vec_named(msg)?;
+    stream.write_u32(data.len() as u32).await?;
+    stream.write_all(&data).await?;
+    stream.flush().await?;
     Ok(())
 }
 
@@ -179,10 +197,9 @@ pub struct ServeHandle {
 }
 
 impl ServeHandle {
-    pub async fn join(self) -> Result<()> {
-        self.handle
-            .await
-            .context("IPC server task panicked or was cancelled")
+    pub async fn join(self) -> Result<(), IpcError> {
+        self.handle.await?;
+        Ok(())
     }
 
     pub fn abort(&self) {
@@ -231,7 +248,10 @@ impl IpcServer {
             socket_path: socket_path.into(),
             discovery,
             hf_upstream,
-            http_client: reqwest::Client::new(),
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("failed to build HTTP client"),
             model_peer_store,
             listen_addr,
             file_cache,
@@ -239,17 +259,16 @@ impl IpcServer {
         }
     }
 
-    pub fn start(self: Arc<Self>) -> Result<ServeHandle> {
+    pub fn start(self: Arc<Self>) -> Result<ServeHandle, IpcError> {
         if self.socket_path.exists() {
-            std::fs::remove_file(&self.socket_path).context("failed to remove stale socket")?;
+            std::fs::remove_file(&self.socket_path)?;
         }
 
         if let Some(parent) = self.socket_path.parent() {
-            std::fs::create_dir_all(parent).context("failed to create socket parent directory")?;
+            std::fs::create_dir_all(parent)?;
         }
 
-        let listener =
-            UnixListener::bind(&self.socket_path).context("failed to bind Unix socket")?;
+        let listener = UnixListener::bind(&self.socket_path)?;
 
         info!(path = %self.socket_path.display(), "IPC server listening");
 
@@ -294,16 +313,17 @@ impl IpcServer {
         &self.file_cache
     }
 
-    async fn handle_connection(&self, mut stream: UnixStream) -> Result<()> {
+    async fn handle_connection(&self, mut stream: UnixStream) -> Result<(), IpcError> {
         let mut state = ConnectionState::Connected;
 
         loop {
             let request: IpcRequest = match read_message(&mut stream).await {
                 Ok(req) => req,
                 Err(e) => {
-                    let is_eof = e
-                        .downcast_ref::<std::io::Error>()
-                        .is_some_and(|io| io.kind() == std::io::ErrorKind::UnexpectedEof);
+                    let is_eof = matches!(
+                        e,
+                        IpcError::Io(ref io) if io.kind() == std::io::ErrorKind::UnexpectedEof
+                    );
 
                     if is_eof {
                         // Crash protection: if we were in Ready state,
@@ -516,7 +536,7 @@ impl IpcServer {
     }
 
     /// Get safetensor files for a model, checking the prefetch cache first.
-    async fn get_model_files(&self, model_id: &str, revision: &str) -> Result<Vec<String>> {
+    async fn get_model_files(&self, model_id: &str, revision: &str) -> Result<Vec<String>, IpcError> {
         // Check cache first (populated by predictive prefetch or previous PrepareModel)
         if let Some(cached) = self.file_cache.get(model_id, revision).await {
             debug!(
@@ -546,7 +566,7 @@ impl IpcServer {
         &self,
         model_id: &str,
         revision: &str,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<String>, IpcError> {
         let url = format!(
             "{}/api/models/{}/revision/{}",
             self.hf_upstream, model_id, revision
@@ -557,13 +577,13 @@ impl IpcServer {
             .get(&url)
             .send()
             .await
-            .context("failed to query HF API")?;
+            .map_err(IpcError::HfApi)?;
 
         if !resp.status().is_success() {
-            anyhow::bail!("HF API returned {}", resp.status());
+            return Err(IpcError::HfApiStatus(resp.status()));
         }
 
-        let body: serde_json::Value = resp.json().await.context("failed to parse HF response")?;
+        let body: serde_json::Value = resp.json().await.map_err(IpcError::HfApiParse)?;
 
         let files: Vec<String> = body
             .get("siblings")

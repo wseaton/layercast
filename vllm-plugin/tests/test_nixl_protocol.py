@@ -8,9 +8,12 @@ either mocked or not needed.
 from __future__ import annotations
 
 import struct
+import time
 from dataclasses import dataclass
+from unittest.mock import MagicMock
 
 import msgpack
+import pytest
 
 from vllm_layercast.proto import (
     Error,
@@ -448,3 +451,60 @@ class TestWeightManifest:
         assert len(missing) == 2
         assert "layer.0.bias" in missing
         assert "layer.1.weight" in missing
+
+
+# wait_transfer tests
+
+
+class TestWaitTransfer:
+    """Test VramNixlAgent.wait_transfer polling, error detection, and timeout."""
+
+    def _make_agent(self) -> "VramNixlAgent":
+        """Build a VramNixlAgent with a mocked NIXL backend."""
+        import vllm_layercast.nixl_agent as mod
+
+        orig_agent = mod._nixl_agent
+        orig_config = mod._nixl_agent_config
+
+        mock_nixl = MagicMock()
+        mock_config_cls = MagicMock()
+        mod._nixl_agent = mock_nixl
+        mod._nixl_agent_config = mock_config_cls
+
+        try:
+            from vllm_layercast.nixl_agent import VramNixlAgent
+
+            agent = VramNixlAgent("test-agent")
+        finally:
+            mod._nixl_agent = orig_agent
+            mod._nixl_agent_config = orig_config
+
+        return agent
+
+    def test_immediate_done(self) -> None:
+        agent = self._make_agent()
+        agent._agent.check_xfer_state.return_value = "DONE"
+        agent.wait_transfer("fake-handle")
+        agent._agent.check_xfer_state.assert_called_once_with("fake-handle")
+
+    def test_done_after_polling(self) -> None:
+        agent = self._make_agent()
+        agent._agent.check_xfer_state.side_effect = ["PROC", "PROC", "PROC", "DONE"]
+        agent.wait_transfer("h")
+        assert agent._agent.check_xfer_state.call_count == 4
+
+    def test_error_raises_runtime_error(self) -> None:
+        """NIXL returns 'ERR' (not 'ERROR') on transfer failure."""
+        agent = self._make_agent()
+        agent._agent.check_xfer_state.side_effect = ["PROC", "ERR"]
+        with pytest.raises(RuntimeError, match="NIXL transfer failed"):
+            agent.wait_transfer("h")
+
+    def test_timeout_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import vllm_layercast.nixl_agent as mod
+
+        monkeypatch.setattr(mod, "_TRANSFER_TIMEOUT_S", 0.0)
+        agent = self._make_agent()
+        agent._agent.check_xfer_state.return_value = "PROC"
+        with pytest.raises(TimeoutError, match="did not complete"):
+            agent.wait_transfer("h")

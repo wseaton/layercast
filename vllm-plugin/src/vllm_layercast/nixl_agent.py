@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import TYPE_CHECKING, Any
 
 from vllm_layercast.checksum import is_enabled as _checksum_enabled
@@ -27,6 +28,12 @@ _NUM_THREADS = int(os.environ.get("LAYERCAST_NIXL_NUM_THREADS", "4"))
 # latency-sensitive inference traffic (KV cache, etc. on SL=0).
 # Set to empty string to disable.
 _IB_SERVICE_LEVEL = os.environ.get("LAYERCAST_IB_SL", "1")
+
+# Maximum seconds to wait for a single NIXL transfer before giving up.
+# Weight transfers for large models (70B+) can take 30-60s over RDMA.
+_TRANSFER_TIMEOUT_S = float(
+    os.environ.get("LAYERCAST_TRANSFER_TIMEOUT", "120")
+)
 
 if TYPE_CHECKING:
     import torch
@@ -243,13 +250,22 @@ class VramNixlAgent:
         return handle
 
     def wait_transfer(self, handle: object) -> None:
-        """Block until a NIXL transfer completes."""
+        """Block until a NIXL transfer completes.
+
+        Polls check_xfer_state in a tight loop (non-blocking call, matches
+        NIXL's recommended pattern). Raises on error or timeout.
+        """
+        deadline = time.monotonic() + _TRANSFER_TIMEOUT_S
         while True:
             state = self._agent.check_xfer_state(handle)
             if state == "DONE":
                 return
-            if state == "ERROR":
+            if state == "ERR":
                 raise RuntimeError("NIXL transfer failed")
+            if time.monotonic() > deadline:
+                raise TimeoutError(
+                    f"NIXL transfer did not complete within {_TRANSFER_TIMEOUT_S}s"
+                )
 
     def close(self) -> None:
         """Release all registered memory and clean up."""
