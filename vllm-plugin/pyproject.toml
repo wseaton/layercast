@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vllm-layercast"
-version = "0.1.0"
+version = "0.2.0"
 description = "Layercast P2P model loading plugin for vLLM"
 requires-python = ">=3.10"
 license = "MIT OR Apache-2.0"
