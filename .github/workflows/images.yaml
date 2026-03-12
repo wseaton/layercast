@@ -3,7 +3,7 @@ name: Container Images
 on:
   push:
     branches: [main]
-    tags: ["v*"]
+    tags: ["v*", "model-mesh-v*", "vllm-plugin-v*"]
 
 permissions:
   contents: read
@@ -18,8 +18,35 @@ env:
   IMAGE: ghcr.io/wseaton/layercast
 
 jobs:
+  # Detect which components changed so we can skip unnecessary builds.
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      model-mesh: ${{ steps.filter.outputs.model-mesh }}
+      vllm-plugin: ${{ steps.filter.outputs.vllm-plugin }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        # Tags always build everything; branch pushes use path filtering.
+        with:
+          filters: |
+            model-mesh:
+              - 'crates/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'Containerfile.model-mesh'
+            vllm-plugin:
+              - 'vllm-plugin/**'
+              - 'Containerfile.vllm-plugin'
+
   model-mesh:
     name: Build model-mesh
+    needs: changes
+    if: >-
+      startsWith(github.ref, 'refs/tags/') ||
+      needs.changes.outputs.model-mesh == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -50,6 +77,10 @@ jobs:
 
   vllm-plugin:
     name: Build vllm-plugin
+    needs: changes
+    if: >-
+      startsWith(github.ref, 'refs/tags/') ||
+      needs.changes.outputs.vllm-plugin == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -84,5 +115,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=vllm-plugin
+          cache-from: |
+            type=gha,scope=vllm-plugin
+            type=registry,ref=${{ env.IMAGE }}:vllm-plugin-main
           cache-to: type=gha,mode=max,scope=vllm-plugin
