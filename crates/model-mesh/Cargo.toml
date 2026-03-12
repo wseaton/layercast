@@ -15,6 +15,7 @@ axum = { workspace = true }
 bytes = { workspace = true }
 discovery = { path = "../discovery" }
 clap = { version = "4", features = ["derive", "env"] }
+hf-hub = { version = "0.4", features = ["tokio"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 futures = { workspace = true }
 rmp-serde = "1"

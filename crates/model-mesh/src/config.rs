@@ -87,3 +87,19 @@ pub struct ProxyConfig {
     #[arg(long, env = "PEER_DISCOVERY_TIMEOUT", default_value_t = 120)]
     pub peer_discovery_timeout: u64,
 }
+
+impl ProxyConfig {
+    /// Extract the port from `listen_addr`. Panics if the address has no valid port,
+    /// since we can't construct correct peer URLs without it.
+    pub fn http_port(&self) -> u16 {
+        self.listen_addr
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse::<u16>().ok())
+            .unwrap_or_else(|| {
+                panic!(
+                    "LISTEN_ADDR '{}' has no valid port (expected host:port)",
+                    self.listen_addr
+                )
+            })
+    }
+}

@@ -28,14 +28,8 @@ pub enum IpcError {
     #[error("message too large: {size} bytes (max {max})")]
     MessageTooLarge { size: u32, max: u32 },
 
-    #[error("HF API request failed: {0}")]
-    HfApi(reqwest::Error),
-
-    #[error("HF API returned {0}")]
-    HfApiStatus(reqwest::StatusCode),
-
-    #[error("failed to parse HF API response: {0}")]
-    HfApiParse(reqwest::Error),
+    #[error("HF Hub API error: {0}")]
+    HfHub(#[from] hf_hub::api::tokio::ApiError),
 
     #[error("IPC server task failed: {0}")]
     TaskJoin(#[from] tokio::task::JoinError),
@@ -226,10 +220,10 @@ const PEER_POLL_INTERVAL: Duration = Duration::from_secs(5);
 pub struct IpcServer {
     socket_path: PathBuf,
     discovery: Arc<dyn PeerDiscovery>,
-    hf_upstream: String,
+    hf_api: hf_hub::api::tokio::Api,
     http_client: reqwest::Client,
     model_peer_store: ModelPeerStore,
-    listen_addr: String,
+    http_port: u16,
     file_cache: FileListCache,
     peer_discovery_timeout: Duration,
 }
@@ -238,22 +232,22 @@ impl IpcServer {
     pub fn new(
         socket_path: impl Into<PathBuf>,
         discovery: Arc<dyn PeerDiscovery>,
-        hf_upstream: String,
+        hf_api: hf_hub::api::tokio::Api,
         model_peer_store: ModelPeerStore,
-        listen_addr: String,
+        http_port: u16,
         file_cache: FileListCache,
         peer_discovery_timeout: Duration,
     ) -> Self {
         Self {
             socket_path: socket_path.into(),
             discovery,
-            hf_upstream,
+            hf_api,
             http_client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .expect("failed to build HTTP client"),
             model_peer_store,
-            listen_addr,
+            http_port,
             file_cache,
             peer_discovery_timeout,
         }
@@ -536,7 +530,11 @@ impl IpcServer {
     }
 
     /// Get safetensor files for a model, checking the prefetch cache first.
-    async fn get_model_files(&self, model_id: &str, revision: &str) -> Result<Vec<String>, IpcError> {
+    async fn get_model_files(
+        &self,
+        model_id: &str,
+        revision: &str,
+    ) -> Result<Vec<String>, IpcError> {
         // Check cache first (populated by predictive prefetch or previous PrepareModel)
         if let Some(cached) = self.file_cache.get(model_id, revision).await {
             debug!(
@@ -567,37 +565,19 @@ impl IpcServer {
         model_id: &str,
         revision: &str,
     ) -> Result<Vec<String>, IpcError> {
-        let url = format!(
-            "{}/api/models/{}/revision/{}",
-            self.hf_upstream, model_id, revision
-        );
-
-        let resp = self
-            .http_client
-            .get(&url)
-            .send()
-            .await
-            .map_err(IpcError::HfApi)?;
-
-        if !resp.status().is_success() {
-            return Err(IpcError::HfApiStatus(resp.status()));
-        }
-
-        let body: serde_json::Value = resp.json().await.map_err(IpcError::HfApiParse)?;
-
-        let files: Vec<String> = body
-            .get("siblings")
-            .and_then(|s| s.as_array())
-            .map(|siblings| {
-                siblings
-                    .iter()
-                    .filter_map(|s| s.get("rfilename").and_then(|f| f.as_str()))
-                    .filter(|f| f.ends_with(".safetensors"))
-                    .map(String::from)
-                    .collect()
-            })
-            .unwrap_or_default();
-
+        let repo = self.hf_api.repo(hf_hub::Repo::with_revision(
+            model_id.to_string(),
+            hf_hub::RepoType::Model,
+            revision.to_string(),
+        ));
+        let info = repo.info().await?;
+        let files = info
+            .siblings
+            .iter()
+            .map(|s| &s.rfilename)
+            .filter(|f| f.ends_with(".safetensors"))
+            .cloned()
+            .collect();
         Ok(files)
     }
 
@@ -635,13 +615,8 @@ impl IpcServer {
             tokio::time::sleep(PEER_POLL_INTERVAL).await;
         };
 
-        let http_port = self
-            .listen_addr
-            .rsplit_once(':')
-            .and_then(|(_, port)| port.parse::<u16>().ok())
-            .unwrap_or(8081);
-
         // Fetch metadata from all peers concurrently
+        let http_port = self.http_port;
         let futs: Vec<_> = peers
             .into_iter()
             .map(|peer| {
@@ -721,9 +696,9 @@ mod tests {
         Arc::new(IpcServer::new(
             socket_path,
             discovery,
-            "https://huggingface.co".to_string(),
+            hf_hub::api::tokio::Api::new().unwrap(),
             ModelPeerStore::new(),
-            "0.0.0.0:8081".into(),
+            8081,
             FileListCache::new(),
             Duration::ZERO, // no retry in tests
         ))
@@ -1000,9 +975,9 @@ mod tests {
         let server = Arc::new(IpcServer::new(
             socket_path.clone(),
             Arc::clone(&discovery) as Arc<dyn discovery::PeerDiscovery>,
-            "https://huggingface.co".to_string(),
+            hf_hub::api::tokio::Api::new().unwrap(),
             nixl_store.clone(),
-            "0.0.0.0:8081".into(),
+            8081,
             FileListCache::new(),
             Duration::ZERO,
         ));
@@ -1068,9 +1043,9 @@ mod tests {
         let server = Arc::new(IpcServer::new(
             socket_path.clone(),
             Arc::clone(&discovery) as Arc<dyn discovery::PeerDiscovery>,
-            "https://huggingface.co".to_string(),
+            hf_hub::api::tokio::Api::new().unwrap(),
             nixl_store.clone(),
-            "0.0.0.0:8081".into(),
+            8081,
             FileListCache::new(),
             Duration::ZERO,
         ));

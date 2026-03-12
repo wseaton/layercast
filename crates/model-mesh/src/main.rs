@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use model_mesh::compile_cache::{CompileCacheNamespace, CompileCacheServer, CompileCacheStore};
@@ -30,7 +30,7 @@ async fn main() -> Result<()> {
         "starting model-mesh daemon"
     );
 
-    // Start K8s discovery backend
+    // start k8s discovery backend
     let k8s_config = discovery::K8sDiscoveryConfig {
         pod_name: config.pod_name.clone(),
         pod_namespace: config.pod_namespace.clone(),
@@ -41,70 +41,59 @@ async fn main() -> Result<()> {
     let discovery: Arc<dyn discovery::PeerDiscovery> =
         Arc::new(discovery::K8sDiscovery::start(k8s_config).await?);
 
-    // Model peer metadata store (shared between IPC server and HTTP API)
     let model_peer_store = ModelPeerStore::new();
-
-    // File list cache for predictive prefetch
     let file_cache = ipc::FileListCache::new();
 
-    // Start IPC server for vLLM plugin communication
+    let http_port = config.http_port();
+
+    // Build HF Hub API client (picks up HF_TOKEN automatically)
+    let hf_api = hf_hub::api::tokio::ApiBuilder::new()
+        .with_endpoint(config.hf_upstream.clone())
+        .build()?;
+
+    // start IPC server for vLLM plugin communication
     let ipc_server = Arc::new(ipc::IpcServer::new(
         config.ipc_socket_path.clone(),
         Arc::clone(&discovery),
-        config.hf_upstream.clone(),
+        hf_api.clone(),
         model_peer_store.clone(),
-        config.listen_addr.clone(),
+        http_port,
         file_cache.clone(),
         Duration::from_secs(config.peer_discovery_timeout),
     ));
     let _ipc_handle = ipc_server.start()?;
     info!(path = %config.ipc_socket_path.display(), "IPC server listening");
 
-    // Predictive prefetch: if MODEL_NAME is set, pre-fetch the file list
+    // if MODEL_NAME is set, pre-fetch the file list
     // from HF API so the first PrepareModel is a cache hit.
     if let Some(ref model_name) = config.model_name {
         let model = model_name.clone();
-        let hf_upstream = config.hf_upstream.clone();
+        let hf_api = hf_api.clone();
         let cache = file_cache.clone();
         tokio::spawn(async move {
             info!(model = %model, "predictive prefetch: fetching file list");
-            let url = format!("{}/api/models/{}/revision/main", hf_upstream, model);
-            let client = reqwest::Client::new();
-            match client.get(&url).send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    if let Ok(body) = resp.json::<serde_json::Value>().await {
-                        let files: Vec<String> = body
-                            .get("siblings")
-                            .and_then(|s| s.as_array())
-                            .map(|siblings| {
-                                siblings
-                                    .iter()
-                                    .filter_map(|s| s.get("rfilename").and_then(|f| f.as_str()))
-                                    .filter(|f| f.ends_with(".safetensors"))
-                                    .map(String::from)
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        info!(
-                            model = %model,
-                            file_count = files.len(),
-                            "predictive prefetch: file list cached"
-                        );
-                        cache.insert(&model, "main", files).await;
-                    }
-                }
-                Ok(resp) => {
-                    tracing::warn!(
+            let repo = hf_api.model(model.clone());
+            match repo.info().await {
+                Ok(info) => {
+                    let files: Vec<String> = info
+                        .siblings
+                        .iter()
+                        .map(|s| &s.rfilename)
+                        .filter(|f| f.ends_with(".safetensors"))
+                        .cloned()
+                        .collect();
+                    info!(
                         model = %model,
-                        status = %resp.status(),
-                        "predictive prefetch: HF API returned non-success"
+                        file_count = files.len(),
+                        "predictive prefetch: file list cached"
                     );
+                    cache.insert(&model, "main", files).await;
                 }
                 Err(e) => {
-                    tracing::warn!(
+                    warn!(
                         model = %model,
                         error = %e,
-                        "predictive prefetch: failed to reach HF API"
+                        "predictive prefetch: failed to fetch from HF Hub"
                     );
                 }
             }
@@ -113,15 +102,18 @@ async fn main() -> Result<()> {
 
     // Compile cache: optionally start the RESP server + store
     let compile_cache = if config.compile_cache_enabled {
-        let http_port = config
-            .listen_addr
-            .rsplit_once(':')
-            .and_then(|(_, port)| port.parse::<u16>().ok())
-            .unwrap_or(8081);
-
         let gpu_product = match &config.gpu_product {
             Some(gpu) => gpu.clone(),
-            None => detect_gpu_product(&config.node_name).await,
+            None => match detect_gpu_product(&config.node_name).await {
+                Ok(gpu) => {
+                    info!(gpu_product = %gpu, "auto-detected GPU product from node labels");
+                    gpu
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to detect GPU product, using 'unknown'");
+                    "unknown".to_string()
+                }
+            },
         };
 
         let image_digest = config
@@ -160,17 +152,12 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Readiness flag: flipped to true once all initialization is done
     let ready = Arc::new(AtomicBool::new(false));
-
-    // Build the internal HTTP API (NIXL metadata exchange + compile cache)
     let router = hf_api::build_internal_router(model_peer_store, compile_cache, Arc::clone(&ready));
 
-    // Start HTTP server with graceful shutdown
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
     info!(listen = %config.listen_addr, "HTTP server listening");
 
-    // All systems go: IPC socket bound, reflectors started, HTTP listener ready.
     ready.store(true, Ordering::Relaxed);
     info!("daemon ready");
 
@@ -184,36 +171,16 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Try to auto-detect GPU product from Kubernetes node labels.
-/// Falls back to "unknown" if detection fails.
-async fn detect_gpu_product(node_name: &str) -> String {
-    match try_detect_gpu_product(node_name).await {
-        Ok(gpu) => {
-            info!(gpu_product = %gpu, "auto-detected GPU product from node labels");
-            gpu
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "failed to detect GPU product, using 'unknown'"
-            );
-            "unknown".to_string()
-        }
-    }
-}
-
-async fn try_detect_gpu_product(node_name: &str) -> Result<String> {
+/// Auto-detect GPU product from the `nvidia.com/gpu.product` Kubernetes node label.
+async fn detect_gpu_product(node_name: &str) -> Result<String> {
     let client = kube::Client::try_default().await?;
     let nodes: kube::Api<k8s_openapi::api::core::v1::Node> = kube::Api::all(client);
     let node = nodes.get(node_name).await?;
 
-    let gpu = node
-        .metadata
+    node.metadata
         .labels
         .as_ref()
         .and_then(|labels| labels.get("nvidia.com/gpu.product"))
         .cloned()
-        .ok_or_else(|| anyhow::anyhow!("node label nvidia.com/gpu.product not found"))?;
-
-    Ok(gpu)
+        .ok_or_else(|| anyhow::anyhow!("node label nvidia.com/gpu.product not found"))
 }

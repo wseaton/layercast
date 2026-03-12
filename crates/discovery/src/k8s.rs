@@ -170,21 +170,49 @@ impl K8sDiscovery {
         let flush_status = Arc::clone(&own_status);
         let flush_dirty = Arc::clone(&status_dirty);
         let flush_handle = tokio::spawn(async move {
+            const MAX_BACKOFF: Duration = Duration::from_secs(30);
+            const MAX_RETRIES: u32 = 5;
+
             loop {
                 flush_dirty.notified().await;
                 // Debounce: wait a short window for more mutations to land
                 tokio::time::sleep(STATUS_DEBOUNCE).await;
 
-                let status_snapshot = flush_status.lock().await.clone();
                 let nc_api: Api<PodCache> = Api::namespaced(flush_client.clone(), &flush_ns);
-                let patch = serde_json::json!({ "status": status_snapshot });
-                if let Err(e) = nc_api
-                    .patch_status(&flush_cr, &PatchParams::default(), &Patch::Merge(patch))
-                    .await
-                {
-                    warn!(error = %e, "debounced status patch failed");
-                } else {
-                    debug!("flushed debounced status patch to API server");
+                let mut attempts = 0u32;
+
+                loop {
+                    let status_snapshot = flush_status.lock().await.clone();
+                    let patch = serde_json::json!({ "status": status_snapshot });
+                    match nc_api
+                        .patch_status(&flush_cr, &PatchParams::default(), &Patch::Merge(patch))
+                        .await
+                    {
+                        Ok(_) => {
+                            debug!("flushed debounced status patch to API server");
+                            break;
+                        }
+                        Err(e) => {
+                            attempts += 1;
+                            if attempts > MAX_RETRIES {
+                                warn!(
+                                    error = %e,
+                                    attempts,
+                                    "status patch failed after max retries, will retry on next mutation"
+                                );
+                                break;
+                            }
+                            let backoff =
+                                Duration::from_millis(100 * 2u64.pow(attempts)).min(MAX_BACKOFF);
+                            warn!(
+                                error = %e,
+                                attempt = attempts,
+                                backoff_ms = backoff.as_millis() as u64,
+                                "status patch failed, retrying"
+                            );
+                            tokio::time::sleep(backoff).await;
+                        }
+                    }
                 }
             }
         });
