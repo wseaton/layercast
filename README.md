@@ -8,7 +8,7 @@ Distributed model weight loading for Kubernetes. Accelerates LLM cold starts by 
 
 ## How it works
 
-A seed pod downloads the model once (from HuggingFace or a shared filesystem). Every subsequent pod pulls weights straight from the seed's GPU memory at ~8 GB/s over InfiniBand. 
+A seed pod downloads the model once (from HuggingFace or a shared filesystem). Every subsequent pod pulls weights straight from the seed's GPU memory at ~8 GB/s over InfiniBand.
 
 Additionally, we also have infrastrcuture for torch.compile cache propogation between peers, so the second consumer onwards skips codegen entirely. This is done by implementing the remote torch dynamo Redis cache API but backed by cooperative peering.
 

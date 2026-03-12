@@ -138,7 +138,12 @@ class DaemonClient:
         try:
             await self._send(msg)
             return await self._recv()
-        except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError, OSError) as exc:
+        except (
+            asyncio.IncompleteReadError,
+            ConnectionResetError,
+            BrokenPipeError,
+            OSError,
+        ) as exc:
             log.warning("ipc_socket_error", error=str(exc), action="reconnecting")
             # Tear down the dead connection and retry once
             await self._reset()

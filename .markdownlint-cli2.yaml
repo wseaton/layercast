@@ -1,0 +1,5 @@
+config:
+  # Prose doesn't need hard wrapping at 80 chars
+  line-length: false
+  # We don't require language on every fenced block
+  fenced-code-language: false

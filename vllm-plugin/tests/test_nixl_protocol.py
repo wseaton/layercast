@@ -8,9 +8,12 @@ either mocked or not needed.
 from __future__ import annotations
 
 import struct
-import time
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
+
+if TYPE_CHECKING:
+    from vllm_layercast.nixl_agent import VramNixlAgent
 
 import msgpack
 import pytest

@@ -31,9 +31,7 @@ _IB_SERVICE_LEVEL = os.environ.get("LAYERCAST_IB_SL", "1")
 
 # Maximum seconds to wait for a single NIXL transfer before giving up.
 # Weight transfers for large models (70B+) can take 30-60s over RDMA.
-_TRANSFER_TIMEOUT_S = float(
-    os.environ.get("LAYERCAST_TRANSFER_TIMEOUT", "120")
-)
+_TRANSFER_TIMEOUT_S = float(os.environ.get("LAYERCAST_TRANSFER_TIMEOUT", "120"))
 
 if TYPE_CHECKING:
     import torch

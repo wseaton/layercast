@@ -1,0 +1,54 @@
+repos:
+  # Standard hooks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+        args: ["--allow-multiple-documents"]
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ["--maxkb=500"]
+
+  # Markdown
+  - repo: https://github.com/DavidAnson/markdownlint-cli2
+    rev: v0.17.2
+    hooks:
+      - id: markdownlint-cli2
+        args: ["--fix"]
+
+  # Rust
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all --
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+  # Python (vllm-plugin)
+  - repo: local
+    hooks:
+      - id: ruff-format
+        name: ruff format
+        entry: uv run --project vllm-plugin ruff format
+        language: system
+        types: [python]
+        files: ^vllm-plugin/
+
+      - id: ruff-check
+        name: ruff check
+        entry: uv run --project vllm-plugin ruff check --fix
+        language: system
+        types: [python]
+        files: ^vllm-plugin/
+
+      - id: ty-check
+        name: ty check
+        entry: uvx ty check --project vllm-plugin --python vllm-plugin/.venv
+        language: system
+        types: [python]
+        files: ^vllm-plugin/
+        pass_filenames: false
