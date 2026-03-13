@@ -338,7 +338,7 @@ class LayercastModelLoader(BaseModelLoader):
         # Register chunk buffers with NIXL (not individual tensors).
         # 8 contiguous regions pin in ~200ms vs ~5.3s for 258 scattered ones.
         chunk_dict = {f"__chunk_{i}__": buf for i, buf in enumerate(alloc.buffers)}
-        agent.register_vram(chunk_dict)
+        agent.pin_vram(chunk_dict)
 
         # Pin chunk buffers at module level so GC can't free them while
         # the NIXL registration is active.

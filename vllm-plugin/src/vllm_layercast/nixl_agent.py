@@ -147,6 +147,34 @@ class VramNixlAgent:
         self._weight_manifest.extend(manifest)
         log.info("vram_registered", count=len(descs))
 
+    def pin_vram(self, buffers: dict[str, "torch.Tensor"]) -> None:
+        """Register VRAM regions for DMA without checksums or manifest.
+
+        Use this for consumer-side chunk buffers that need to be pinned
+        for NIXL transfers but don't contain data yet and shouldn't be
+        published to peers.
+        """
+        if not buffers:
+            return
+
+        descs: list[tuple[int, int, int, str]] = []
+        for name, tensor in buffers.items():
+            if name in self._registered_names:
+                continue
+            addr = tensor.data_ptr()
+            nbytes = tensor.nelement() * tensor.element_size()
+            device_id = tensor.device.index if tensor.device.index is not None else 0
+            descs.append((addr, nbytes, device_id, name))
+
+        if not descs:
+            return
+
+        log.info("pinning_vram", regions=len(descs))
+        reg = self._agent.register_memory(descs, mem_type="VRAM")
+        self._registered_descs.append(reg)
+        self._registered_names.update(buffers.keys())
+        log.info("vram_pinned", regions=len(descs))
+
     def get_metadata(self) -> bytes:
         """Export this agent's metadata for sharing with remote agents."""
         md = self._agent.get_agent_metadata()
