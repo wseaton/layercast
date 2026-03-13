@@ -454,6 +454,9 @@ impl IpcServer {
         // Step 2: Find model peers and fetch their metadata.
         let peers = self.discover_and_fetch_peers(&model_id, tp_rank).await;
 
+        // Step 3: If multiple peers, compute a balanced transfer plan.
+        let transfer_plan = crate::transfer_plan::compute_transfer_plan(&peers);
+
         info!(
             model_id,
             revision,
@@ -461,6 +464,7 @@ impl IpcServer {
             file_count = model_info.files.len(),
             peer_count = peers.len(),
             weight_map_entries = model_info.weight_map.len(),
+            transfer_plan_entries = transfer_plan.len(),
             "PrepareModel: complete"
         );
 
@@ -472,7 +476,7 @@ impl IpcServer {
                     files: model_info.files,
                     peers,
                     weight_map: model_info.weight_map,
-                    transfer_plan: Vec::new(),
+                    transfer_plan,
                 })),
             },
             next_state,

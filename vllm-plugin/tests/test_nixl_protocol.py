@@ -24,6 +24,7 @@ from vllm_layercast.proto import (
     ModelUnloaded,
     Ok,
     PeerNixlMd,
+    PeerTransferAssignment,
     Prepared,
     PrepareModel,
     TensorInfo,
@@ -481,3 +482,93 @@ class TestWaitTransfer:
         agent._agent.check_xfer_state.return_value = "PROC"
         with pytest.raises(TimeoutError, match="did not complete"):
             agent.wait_transfer("h")
+
+
+# PeerTransferAssignment tests
+
+
+class TestPeerTransferAssignment:
+    """Verify PeerTransferAssignment round-trips correctly."""
+
+    def test_roundtrip(self) -> None:
+        assignment = PeerTransferAssignment(
+            agent_name="peer-0",
+            nixl_md=b"\xca\xfe",
+            tensors=[
+                TensorInfo(name="layer.0.weight", addr=0x7F00, size=4096, device_id=0),
+                TensorInfo(name="layer.1.weight", addr=0x8F00, size=4096, device_id=0),
+            ],
+            assigned_tensors=["layer.0.weight"],
+        )
+        wire = bytes(assignment)
+        decoded = PeerTransferAssignment().parse(wire)
+        assert decoded.agent_name == "peer-0"
+        assert decoded.nixl_md == b"\xca\xfe"
+        assert len(decoded.tensors) == 2
+        assert decoded.assigned_tensors == ["layer.0.weight"]
+
+    def test_prepared_with_transfer_plan(self) -> None:
+        """Prepared response carries a transfer plan for multi-peer."""
+        resp = IpcResponse(
+            prepared=Prepared(
+                files=["shard.safetensors"],
+                peers=[
+                    PeerNixlMd(
+                        agent_name="p0",
+                        nixl_md=b"\xaa",
+                        tensors=[
+                            TensorInfo(name="w0", addr=100, size=1000, device_id=0),
+                            TensorInfo(name="w1", addr=200, size=2000, device_id=0),
+                        ],
+                    ),
+                    PeerNixlMd(
+                        agent_name="p1",
+                        nixl_md=b"\xbb",
+                        tensors=[
+                            TensorInfo(name="w0", addr=300, size=1000, device_id=0),
+                            TensorInfo(name="w1", addr=400, size=2000, device_id=0),
+                        ],
+                    ),
+                ],
+                transfer_plan=[
+                    PeerTransferAssignment(
+                        agent_name="p0",
+                        nixl_md=b"\xaa",
+                        tensors=[
+                            TensorInfo(name="w0", addr=100, size=1000, device_id=0),
+                            TensorInfo(name="w1", addr=200, size=2000, device_id=0),
+                        ],
+                        assigned_tensors=["w1"],
+                    ),
+                    PeerTransferAssignment(
+                        agent_name="p1",
+                        nixl_md=b"\xbb",
+                        tensors=[
+                            TensorInfo(name="w0", addr=300, size=1000, device_id=0),
+                            TensorInfo(name="w1", addr=400, size=2000, device_id=0),
+                        ],
+                        assigned_tensors=["w0"],
+                    ),
+                ],
+            )
+        )
+        wire = bytes(resp)
+        decoded = decode_response(wire)
+        assert len(decoded.prepared.transfer_plan) == 2
+        assert decoded.prepared.transfer_plan[0].agent_name == "p0"
+        assert decoded.prepared.transfer_plan[0].assigned_tensors == ["w1"]
+        assert decoded.prepared.transfer_plan[1].agent_name == "p1"
+        assert decoded.prepared.transfer_plan[1].assigned_tensors == ["w0"]
+
+    def test_empty_transfer_plan_for_single_peer(self) -> None:
+        """Single peer produces no transfer plan (empty list)."""
+        resp = IpcResponse(
+            prepared=Prepared(
+                files=["shard.safetensors"],
+                peers=[PeerNixlMd(agent_name="p0", nixl_md=b"\xaa")],
+                transfer_plan=[],
+            )
+        )
+        wire = bytes(resp)
+        decoded = decode_response(wire)
+        assert decoded.prepared.transfer_plan == []

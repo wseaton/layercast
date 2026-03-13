@@ -43,6 +43,9 @@ except ImportError:
             "Install it or run within a vLLM environment."
         )
 
+from huggingface_hub import try_to_load_from_cache  # noqa: E402
+from safetensors import safe_open  # noqa: E402
+
 from vllm_layercast.backend_rust import RustSidecarBackend  # noqa: E402
 from vllm_layercast.checksum import is_enabled as _checksum_enabled  # noqa: E402
 from vllm_layercast.checksum import verify_checksums  # noqa: E402
@@ -100,7 +103,6 @@ class LayercastModelLoader(BaseModelLoader):
         # Single batched call for file list + peers
         prepared = self._prepare_model(repo_id, revision, tp_rank)
         weight_files = prepared.files if prepared else []
-        peers = prepared.peers if prepared else []
         if not weight_files:
             weight_files = self._get_weight_files(model_config)
         if not weight_files:
@@ -112,7 +114,7 @@ class LayercastModelLoader(BaseModelLoader):
 
         # first, NIXL GPUDirect RDMA from peer VRAM
         if self._try_nixl_load(
-            model, repo_id, revision, weight_files, tp_rank, peers=peers
+            model, repo_id, revision, weight_files, tp_rank, prepared=prepared
         ):
             loaded = True
             elapsed = time.monotonic() - t_start
@@ -180,7 +182,7 @@ class LayercastModelLoader(BaseModelLoader):
                 revision,
                 weight_files,
                 tp_rank,
-                peers=peers,
+                prepared=prepared,
             ):
                 elapsed = time.monotonic() - t_start
                 log.info(
@@ -216,31 +218,18 @@ class LayercastModelLoader(BaseModelLoader):
         revision: str,
         weight_files: list[str],
         tp_rank: int,
-        peers: list[PeerNixlMd] | None = None,
+        prepared: Prepared | None = None,
     ) -> bool:
         """Zero-copy NIXL GPUDirect RDMA weight transfer from peer VRAM.
 
-        After initialize_model(), params live on meta device (shape/dtype known
-        but no storage). We materialize each param to CUDA, then NIXL READ from
-        the seed's VRAM directly into our parameter storage. The result is that
-        model.parameters() point at buffers filled by RDMA with no intermediate
-        copies.
-
-        Peer metadata is structured protobuf:
-          PeerNixlMd { nixl_md: bytes, tensors: [TensorInfo { name, addr, size, ... }] }
+        Dispatches to single-peer or multi-peer path based on transfer_plan.
+        Falls back to disk for any tensors that fail to transfer.
         """
-        if peers is None:
+        if prepared is None:
             prepared = self._prepare_model(repo_id, revision, tp_rank)
-            peers = prepared.peers if prepared else []
-
-        if not peers:
+        if prepared is None or not prepared.peers:
             log.debug("nixl_no_peers", model=repo_id, rank=tp_rank)
             return False
-
-        peer = peers[0]
-        log.info(
-            "nixl_peer_found", agent=peer.agent_name, metadata_bytes=len(peer.nixl_md)
-        )
 
         try:
             agent = self._ensure_nixl_agent(tp_rank)
@@ -248,33 +237,36 @@ class LayercastModelLoader(BaseModelLoader):
             log.warning("nixl_agent_init_failed", error=str(exc))
             return False
 
-        nixl_md = peer.nixl_md
-        remote_manifest: dict[str, TensorInfo] = {t.name: t for t in peer.tensors}
+        if prepared.transfer_plan:
+            return self._nixl_load_multi_peer(model, agent, prepared, weight_files)
+        return self._nixl_load_single_peer(
+            model, agent, prepared.peers[0], weight_files
+        )
 
+    def _nixl_load_single_peer(
+        self,
+        model: nn.Module,
+        agent: VramNixlAgent,
+        peer: PeerNixlMd,
+        weight_files: list[str],
+    ) -> bool:
+        """Transfer all weights from a single peer via NIXL GPUDirect."""
+        log.info(
+            "nixl_peer_found", agent=peer.agent_name, metadata_bytes=len(peer.nixl_md)
+        )
+
+        remote_manifest: dict[str, TensorInfo] = {t.name: t for t in peer.tensors}
         if not remote_manifest:
             log.warning("nixl_empty_manifest")
             return False
 
-        peer_name = agent.load_peer_metadata(nixl_md)
+        peer_name = agent.load_peer_metadata(peer.nixl_md)
         log.info(
             "nixl_peer_loaded", peer=peer_name, remote_tensors=len(remote_manifest)
         )
 
-        # Materialize meta params to CUDA and match against remote manifest.
-        # Use the remote manifest's dtype (not the meta-device param dtype,
-        # which defaults to float32 before weight loading).
         t_xfer = time.monotonic()
-        device = f"cuda:{torch.cuda.current_device()}"
-        local_tensors: dict[str, torch.Tensor] = {}
-        for name, param in model.named_parameters():
-            if name not in remote_manifest:
-                continue
-            remote_info = remote_manifest[name]
-            dtype = _parse_torch_dtype(remote_info.dtype or None, param.dtype)
-            cuda_buf = torch.empty(param.shape, dtype=dtype, device=device)
-            param.data = cuda_buf
-            local_tensors[name] = cuda_buf
-
+        local_tensors = _materialize_params(model, remote_manifest)
         if not local_tensors:
             log.warning("nixl_no_matching_params")
             return False
@@ -285,159 +277,122 @@ class LayercastModelLoader(BaseModelLoader):
             remote=len(remote_manifest),
         )
 
-        # Split tensors into large (individual transfers) and small (coalesced).
-        # Small tensors (<1MB, e.g. layer norms, biases) get packed into a
-        # contiguous CUDA buffer and transferred in one NIXL operation to
-        # avoid per-transfer overhead.
-        large_tensors: dict[str, torch.Tensor] = {}
-        small_entries: list[tuple[str, torch.Tensor]] = []
-        for name, tensor in local_tensors.items():
-            nbytes = tensor.nelement() * tensor.element_size()
-            if nbytes < _COALESCE_THRESHOLD:
-                small_entries.append((name, tensor))
-            else:
-                large_tensors[name] = tensor
-
-        # Only register large tensors with NIXL (they receive data directly).
-        # Small tensors receive via the coalesce buffer, so skip their
-        # individual registration to save ~3s.
-        agent.register_vram(large_tensors)
-
-        handles: list[tuple[str, object]] = []
-
-        # Coalesced transfer for small tensors
-        if small_entries:
-            total_small = sum(t.nelement() * t.element_size() for _, t in small_entries)
-            coalesce_buf = torch.empty(total_small, dtype=torch.uint8, device=device)
-            agent.register_vram({"__coalesced__": coalesce_buf})
-
-            remote_regions: list[tuple[int, int, int]] = []
-            offsets: list[int] = []
-            scatter_plan: list[tuple[str, int, int]] = []  # (name, offset, nbytes)
-            offset = 0
-            for name, tensor in small_entries:
-                remote = remote_manifest[name]
-                nbytes = remote.size
-                remote_regions.append((remote.addr, nbytes, remote.device_id))
-                offsets.append(offset)
-                scatter_plan.append((name, offset, nbytes))
-                offset += nbytes
-
-            try:
-                handle = agent.read_coalesced_from_peer(
-                    coalesce_buf,
-                    remote_regions,
-                    offsets,
-                    peer_name,
-                )
-                handles.append(("__coalesced__", handle))
-            except Exception as exc:
-                log.warning("nixl_coalesced_read_failed", error=str(exc))
-                return False
-
-            log.info(
-                "nixl_coalesced",
-                tensors=len(small_entries),
-                total_kb=total_small / 1024,
-            )
-
-        # Individual transfers for large tensors
-        for name, local_tensor in large_tensors.items():
-            remote = remote_manifest[name]
-            try:
-                handle = agent.read_from_peer(
-                    local_tensor=local_tensor,
-                    remote_addr=remote.addr,
-                    remote_len=remote.size,
-                    peer_name=peer_name,
-                    remote_device_id=remote.device_id,
-                )
-                handles.append((name, handle))
-            except Exception as exc:
-                log.warning("nixl_read_failed", tensor=name, error=str(exc))
-                return False
-
-        # Wait for all transfers
-        for name, handle in handles:
-            try:
-                agent.wait_transfer(handle)
-            except (RuntimeError, TimeoutError) as exc:
-                log.warning("nixl_transfer_failed", tensor=name, error=str(exc))
-                return False
-
-        # Build expected checksums from remote manifest (0 means unset in proto3).
-        expected_checksums: dict[str, int] = {}
-        if _checksum_enabled():
-            expected_checksums = {
-                name: info.checksum
-                for name, info in remote_manifest.items()
-                if info.checksum != 0
-            }
-
-        t_checksum = time.monotonic()
-
-        # Verify large tensors (already in their final CUDA buffers)
-        if expected_checksums and large_tensors:
-            mismatched = verify_checksums(large_tensors, expected_checksums)
-            if mismatched:
-                log.error(
-                    "checksum_verification_failed",
-                    phase="large",
-                    mismatched=mismatched,
-                    peer=peer_name,
-                )
-                return False
-
-        # Scatter coalesced buffer back into individual param tensors
-        if small_entries:
-            for name, buf_offset, nbytes in scatter_plan:
-                src = coalesce_buf[buf_offset : buf_offset + nbytes]
-                dst = local_tensors[name]
-                dst.data.copy_(src.view(dst.dtype).reshape(dst.shape))
-            del coalesce_buf
-
-        # Verify small tensors AFTER scatter (checksum was computed on the
-        # source's original tensor, not the coalesced uint8 layout)
-        if expected_checksums and small_entries:
-            small_tensor_dict = {
-                name: local_tensors[name] for name, _, _ in scatter_plan
-            }
-            mismatched = verify_checksums(small_tensor_dict, expected_checksums)
-            if mismatched:
-                log.error(
-                    "checksum_verification_failed",
-                    phase="small",
-                    mismatched=mismatched,
-                    peer=peer_name,
-                )
-                return False
-
-        checksum_elapsed = time.monotonic() - t_checksum
-
-        # Log verification result when checksums were checked
-        if expected_checksums:
-            log.info(
-                "checksum_verification",
-                verified=len(expected_checksums),
-                mismatched=0,
-                elapsed_s=round(checksum_elapsed, 3),
-            )
-
-        xfer_elapsed = time.monotonic() - t_xfer
-        total_bytes = sum(
-            t.nelement() * t.element_size() for t in local_tensors.values()
+        failed = _issue_and_wait_transfers(
+            agent, peer_name, remote_manifest, local_tensors
         )
-        gbps = (total_bytes / 1e9) / xfer_elapsed if xfer_elapsed > 0 else 0.0
+
+        if failed:
+            log.warning(
+                "nixl_partial_failure",
+                failed=len(failed),
+                total=len(local_tensors),
+                peer=peer_name,
+            )
+            if not _fallback_tensors_from_disk(
+                failed, local_tensors, self._weight_map, weight_files
+            ):
+                return False
+
+        if not _verify_checksums_all(local_tensors, remote_manifest, peer_name):
+            return False
+
+        _log_transfer_stats(t_xfer, local_tensors, peer_name)
+        return True
+
+    def _nixl_load_multi_peer(
+        self,
+        model: nn.Module,
+        agent: VramNixlAgent,
+        prepared: Prepared,
+        weight_files: list[str],
+    ) -> bool:
+        """Transfer weights from multiple peers using the scheduler's plan.
+
+        Each PeerTransferAssignment specifies which tensors to pull from which
+        peer. This spreads the transfer load across peers for ~linear speedup.
+        """
+        plan = prepared.transfer_plan
         log.info(
-            "nixl_transfer_complete",
-            elapsed_s=xfer_elapsed,
-            total_bytes=total_bytes,
-            gbps=gbps,
-            tensors=len(local_tensors),
-            large=len(large_tensors),
-            coalesced=len(small_entries),
-            peer=peer_name,
+            "nixl_multi_peer_start",
+            peers=len(plan),
+            total_assignments=sum(len(a.assigned_tensors) for a in plan),
         )
+
+        # Build a unified remote manifest from the first peer (all peers
+        # have the same model, so tensor metadata is identical).
+        all_tensors = prepared.peers[0].tensors if prepared.peers else []
+        remote_manifest: dict[str, TensorInfo] = {t.name: t for t in all_tensors}
+        if not remote_manifest:
+            log.warning("nixl_empty_manifest")
+            return False
+
+        # Load metadata for all peers.
+        peer_names: dict[str, str] = {}
+        for assignment in plan:
+            peer_names[assignment.agent_name] = agent.load_peer_metadata(
+                assignment.nixl_md
+            )
+            log.info(
+                "nixl_peer_loaded",
+                peer=peer_names[assignment.agent_name],
+                assigned_tensors=len(assignment.assigned_tensors),
+            )
+
+        t_xfer = time.monotonic()
+        local_tensors = _materialize_params(model, remote_manifest)
+        if not local_tensors:
+            log.warning("nixl_no_matching_params")
+            return False
+
+        log.info(
+            "nixl_materialized",
+            matched=len(local_tensors),
+            remote=len(remote_manifest),
+            peers=len(plan),
+        )
+
+        # Issue transfers per peer, collect all failures.
+        all_failed: list[str] = []
+        for assignment in plan:
+            peer_name = peer_names[assignment.agent_name]
+            # Filter local_tensors to only those assigned to this peer.
+            assigned_set = set(assignment.assigned_tensors)
+            peer_local = {n: t for n, t in local_tensors.items() if n in assigned_set}
+            if not peer_local:
+                continue
+
+            # Build a per-peer manifest (same data, just scoped).
+            peer_manifest = {
+                n: remote_manifest[n] for n in peer_local if n in remote_manifest
+            }
+
+            failed = _issue_and_wait_transfers(
+                agent, peer_name, peer_manifest, peer_local
+            )
+            if failed:
+                log.warning(
+                    "nixl_peer_partial_failure",
+                    peer=peer_name,
+                    failed=len(failed),
+                    assigned=len(peer_local),
+                )
+                all_failed.extend(failed)
+
+        if all_failed:
+            log.warning(
+                "nixl_multi_peer_partial_failure",
+                failed=len(all_failed),
+                total=len(local_tensors),
+            )
+            if not _fallback_tensors_from_disk(
+                all_failed, local_tensors, self._weight_map, weight_files
+            ):
+                return False
+
+        if not _verify_checksums_all(local_tensors, remote_manifest, "multi-peer"):
+            return False
+
+        _log_transfer_stats(t_xfer, local_tensors, f"multi-peer({len(plan)})")
         return True
 
     def _publish_vram(
@@ -670,6 +625,272 @@ class LayercastModelLoader(BaseModelLoader):
             self._backend = RustSidecarBackend(socket_path=socket_path)
             await self._backend.start()
         return self._backend
+
+
+def _materialize_params(
+    model: nn.Module,
+    remote_manifest: dict[str, TensorInfo],
+) -> dict[str, "torch.Tensor"]:
+    """Materialize meta-device params to CUDA, matching remote manifest dtypes."""
+    device = f"cuda:{torch.cuda.current_device()}"
+    local_tensors: dict[str, torch.Tensor] = {}
+    for name, param in model.named_parameters():
+        if name not in remote_manifest:
+            continue
+        remote_info = remote_manifest[name]
+        dtype = _parse_torch_dtype(remote_info.dtype or None, param.dtype)
+        cuda_buf = torch.empty(param.shape, dtype=dtype, device=device)
+        param.data = cuda_buf
+        local_tensors[name] = cuda_buf
+    return local_tensors
+
+
+def _issue_and_wait_transfers(
+    agent: VramNixlAgent,
+    peer_name: str,
+    remote_manifest: dict[str, TensorInfo],
+    local_tensors: dict[str, "torch.Tensor"],
+) -> list[str]:
+    """Issue NIXL reads and wait for completion. Returns names of failed tensors.
+
+    Splits tensors into large (individual) and small (coalesced) transfers.
+    On failure, collects the tensor names that failed rather than aborting.
+    """
+    device = f"cuda:{torch.cuda.current_device()}"
+    large_tensors: dict[str, torch.Tensor] = {}
+    small_entries: list[tuple[str, torch.Tensor]] = []
+    for name, tensor in local_tensors.items():
+        nbytes = tensor.nelement() * tensor.element_size()
+        if nbytes < _COALESCE_THRESHOLD:
+            small_entries.append((name, tensor))
+        else:
+            large_tensors[name] = tensor
+
+    agent.register_vram(large_tensors)
+
+    handles: list[tuple[str | list[str], object]] = []
+    failed: list[str] = []
+
+    # Coalesced transfer for small tensors
+    if small_entries:
+        total_small = sum(t.nelement() * t.element_size() for _, t in small_entries)
+        coalesce_buf = torch.empty(total_small, dtype=torch.uint8, device=device)
+        agent.register_vram({"__coalesced__": coalesce_buf})
+
+        remote_regions: list[tuple[int, int, int]] = []
+        offsets: list[int] = []
+        scatter_plan: list[tuple[str, int, int]] = []
+        offset = 0
+        for name, tensor in small_entries:
+            remote = remote_manifest[name]
+            nbytes = remote.size
+            remote_regions.append((remote.addr, nbytes, remote.device_id))
+            offsets.append(offset)
+            scatter_plan.append((name, offset, nbytes))
+            offset += nbytes
+
+        try:
+            handle = agent.read_coalesced_from_peer(
+                coalesce_buf, remote_regions, offsets, peer_name
+            )
+            small_names = [n for n, _ in small_entries]
+            handles.append((small_names, handle))
+        except Exception as exc:
+            log.warning("nixl_coalesced_read_failed", error=str(exc), peer=peer_name)
+            failed.extend(n for n, _ in small_entries)
+
+        log.info(
+            "nixl_coalesced",
+            tensors=len(small_entries),
+            total_kb=total_small / 1024,
+            peer=peer_name,
+        )
+
+    # Individual transfers for large tensors
+    for name, local_tensor in large_tensors.items():
+        remote = remote_manifest[name]
+        try:
+            handle = agent.read_from_peer(
+                local_tensor=local_tensor,
+                remote_addr=remote.addr,
+                remote_len=remote.size,
+                peer_name=peer_name,
+                remote_device_id=remote.device_id,
+            )
+            handles.append((name, handle))
+        except Exception as exc:
+            log.warning("nixl_read_failed", tensor=name, error=str(exc))
+            failed.append(name)
+
+    # Wait for all transfers, collecting failures
+    for tag, handle in handles:
+        try:
+            agent.wait_transfer(handle)
+        except (RuntimeError, TimeoutError) as exc:
+            if isinstance(tag, list):
+                log.warning("nixl_coalesced_transfer_failed", error=str(exc))
+                failed.extend(tag)
+            else:
+                log.warning("nixl_transfer_failed", tensor=tag, error=str(exc))
+                failed.append(tag)
+
+    # Scatter coalesced buffer back into individual param tensors
+    if small_entries and not any(n in failed for n, _ in small_entries):
+        for name, buf_offset, nbytes in scatter_plan:
+            src = coalesce_buf[buf_offset : buf_offset + nbytes]
+            dst = local_tensors[name]
+            dst.data.copy_(src.view(dst.dtype).reshape(dst.shape))
+        del coalesce_buf
+
+    return failed
+
+
+def _verify_checksums_all(
+    local_tensors: dict[str, "torch.Tensor"],
+    remote_manifest: dict[str, TensorInfo],
+    peer_label: str,
+) -> bool:
+    """Verify checksums for all transferred tensors. Returns True if OK."""
+    if not _checksum_enabled():
+        return True
+
+    expected: dict[str, int] = {
+        name: info.checksum
+        for name, info in remote_manifest.items()
+        if info.checksum != 0 and name in local_tensors
+    }
+    if not expected:
+        return True
+
+    t_checksum = time.monotonic()
+    mismatched = verify_checksums(local_tensors, expected)
+    elapsed = time.monotonic() - t_checksum
+
+    if mismatched:
+        log.error(
+            "checksum_verification_failed",
+            mismatched=mismatched,
+            peer=peer_label,
+        )
+        return False
+
+    log.info(
+        "checksum_verification",
+        verified=len(expected),
+        mismatched=0,
+        elapsed_s=round(elapsed, 3),
+    )
+    return True
+
+
+def _log_transfer_stats(
+    t_start: float,
+    local_tensors: dict[str, "torch.Tensor"],
+    peer_label: str,
+) -> None:
+    """Log transfer completion stats."""
+    elapsed = time.monotonic() - t_start
+    total_bytes = sum(t.nelement() * t.element_size() for t in local_tensors.values())
+    gbps = (total_bytes / 1e9) / elapsed if elapsed > 0 else 0.0
+    log.info(
+        "nixl_transfer_complete",
+        elapsed_s=elapsed,
+        total_bytes=total_bytes,
+        gbps=gbps,
+        tensors=len(local_tensors),
+        peer=peer_label,
+    )
+
+
+def _fallback_tensors_from_disk(
+    failed_names: list[str],
+    local_tensors: dict[str, "torch.Tensor"],
+    weight_map: dict[str, str],
+    weight_files: list[str],
+) -> bool:
+    """Load specific tensors from safetensors files on disk.
+
+    Uses the weight_map to find which shard file contains each tensor.
+    Falls back to scanning all weight files if weight_map is unavailable.
+    Returns True if all failed tensors were recovered, False otherwise.
+    """
+    if not failed_names:
+        return True
+
+    log.info(
+        "disk_fallback_start",
+        tensors=len(failed_names),
+    )
+
+    # Group tensors by shard file
+    file_to_tensors: dict[str, list[str]] = {}
+    unmapped: list[str] = []
+    for name in failed_names:
+        shard = weight_map.get(name)
+        if shard:
+            file_to_tensors.setdefault(shard, []).append(name)
+        else:
+            unmapped.append(name)
+
+    # For unmapped tensors (no weight_map or single-shard), try all files
+    if unmapped:
+        for fname in weight_files:
+            file_to_tensors.setdefault(fname, []).extend(unmapped)
+
+    recovered = 0
+    device = f"cuda:{torch.cuda.current_device()}"
+
+    for shard_file, tensor_names in file_to_tensors.items():
+        # Resolve the shard file path. Try HF cache first, then check
+        # if it's already an absolute path.
+        shard_path = _resolve_shard_path(shard_file)
+        if shard_path is None:
+            log.warning("shard_file_not_found", file=shard_file)
+            continue
+
+        try:
+            with safe_open(shard_path, framework="pt", device=device) as f:
+                available = set(f.keys())
+                for name in tensor_names:
+                    if name not in available:
+                        continue
+                    if name not in local_tensors:
+                        continue
+                    tensor = f.get_tensor(name)
+                    local_tensors[name].data.copy_(tensor)
+                    recovered += 1
+        except Exception as exc:
+            log.warning(
+                "disk_fallback_shard_failed",
+                file=shard_file,
+                error=str(exc),
+            )
+
+    success = recovered >= len(failed_names)
+    log.info(
+        "disk_fallback_complete",
+        recovered=recovered,
+        needed=len(failed_names),
+        success=success,
+    )
+    return success
+
+
+def _resolve_shard_path(shard_file: str) -> str | None:
+    """Find the local path for a safetensors shard file.
+
+    Checks HF cache via huggingface_hub, then looks for it as an absolute path.
+    """
+    if os.path.isfile(shard_file):
+        return shard_file
+
+    cached = try_to_load_from_cache(
+        repo_id="",  # we don't know the repo_id here
+        filename=shard_file,
+    )
+    if cached and os.path.isfile(cached):
+        return cached
+    return None
 
 
 def _get_tp_rank() -> int:

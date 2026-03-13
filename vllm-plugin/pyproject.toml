@@ -10,6 +10,8 @@ requires-python = ">=3.10"
 license = "MIT OR Apache-2.0"
 dependencies = [
     "betterproto>=2.0.0b7",
+    "huggingface-hub",
+    "safetensors",
     "structlog>=24.0",
 ]
 
@@ -38,4 +40,6 @@ allowed-unresolved-imports = [
     "triton",
     "vllm.**",
     "nixl.**",
+    "safetensors.**",
+    "huggingface_hub.**",
 ]
