@@ -48,8 +48,20 @@ except ImportError:
 from vllm_layercast.backend_rust import RustSidecarBackend  # noqa: E402
 from vllm_layercast.checksum import is_enabled as _checksum_enabled  # noqa: E402
 from vllm_layercast.checksum import verify_checksums  # noqa: E402
-from vllm_layercast.nixl_agent import VramNixlAgent, _COALESCE_THRESHOLD  # noqa: E402
+from vllm_layercast.nixl_agent import (  # noqa: E402
+    VramNixlAgent,
+    _COALESCE_THRESHOLD,
+)
 from vllm_layercast.proto import PeerNixlMd  # noqa: E402
+
+# Target chunk size for contiguous VRAM buffer allocation (bytes).
+# Total weight size is divided by this to get the chunk count (power of 2).
+# Smaller chunks = more registration calls = slower pinning.
+# Larger chunks = fewer calls but bigger individual allocations.
+# Default 8GB gives ~8 chunks for a 65GB model, ~2 for a 7B model.
+_CHUNK_TARGET_BYTES = int(
+    os.environ.get("LAYERCAST_CHUNK_TARGET_BYTES", str(8 * 1024 * 1024 * 1024))
+)
 
 # Keep NIXL agents alive for the process lifetime so remote peers can
 # RDMA-read. Without this, the agent (and its registered memory)
@@ -63,6 +75,11 @@ _NIXL_AGENTS_LOCK = threading.Lock()
 # crash and auto-unadvertises, nuking the CRD entry before any consumer
 # can discover us.
 _BACKEND_KEEPALIVE: tuple[asyncio.AbstractEventLoop, RustSidecarBackend] | None = None
+
+# Chunk buffers backing the chunked VRAM allocation. Must stay alive
+# (pinned with the NIC) for the lifetime of the model so RDMA reads
+# from peers hit valid registered memory.
+_CHUNK_BUFFERS: list[torch.Tensor] = []
 
 
 class LayercastModelLoader(BaseModelLoader):
@@ -266,43 +283,66 @@ class LayercastModelLoader(BaseModelLoader):
         # which defaults to float32 before weight loading).
         t_xfer = time.monotonic()
         device = f"cuda:{torch.cuda.current_device()}"
-        local_tensors: dict[str, torch.Tensor] = {}
+
+        # Collect specs for all matching tensors, split into large/small.
+        large_specs: list[tuple[str, torch.Size, torch.dtype]] = []
+        small_specs: list[tuple[str, torch.Size, torch.dtype]] = []
+        param_map: dict[str, nn.Parameter] = {}
         for name, param in model.named_parameters():
             if name not in remote_manifest:
                 continue
             remote_info = remote_manifest[name]
             dtype = _parse_torch_dtype(remote_info.get("dtype"), param.dtype)
-            cuda_buf = torch.empty(param.shape, dtype=dtype, device=device)
-            param.data = cuda_buf
-            local_tensors[name] = cuda_buf
+            nbytes = param.shape.numel() * dtype.itemsize
+            if nbytes < _COALESCE_THRESHOLD:
+                small_specs.append((name, param.shape, dtype))
+            else:
+                large_specs.append((name, param.shape, dtype))
+            param_map[name] = param
 
-        if not local_tensors:
+        if not param_map:
             log.warning("nixl_no_matching_params")
             return False
+
+        # Allocate large tensors into contiguous chunk buffers to reduce
+        # NIXL memory registration calls (258 individual pins -> 8 chunks).
+        # Each chunk is one contiguous VRAM allocation; tensors are views.
+        alloc = _allocate_chunked(large_specs, device, _CHUNK_TARGET_BYTES)
+        large_tensors: dict[str, torch.Tensor] = alloc.views
+
+        # Allocate small tensors individually (they go through the coalesce
+        # buffer for transfer anyway, so no registration cost).
+        small_entries: list[tuple[str, torch.Tensor]] = []
+        for name, shape, dtype in small_specs:
+            buf = torch.empty(shape, dtype=dtype, device=device)
+            small_entries.append((name, buf))
+
+        # Wire all views/buffers back to model params.
+        local_tensors: dict[str, torch.Tensor] = {}
+        for name, tensor in large_tensors.items():
+            param_map[name].data = tensor
+            local_tensors[name] = tensor
+        for name, tensor in small_entries:
+            param_map[name].data = tensor
+            local_tensors[name] = tensor
 
         log.info(
             "nixl_materialized",
             matched=len(local_tensors),
             remote=len(remote_manifest),
+            large=len(large_tensors),
+            small=len(small_entries),
+            chunks=len(alloc.buffers),
         )
 
-        # Split tensors into large (individual transfers) and small (coalesced).
-        # Small tensors (<1MB, e.g. layer norms, biases) get packed into a
-        # contiguous CUDA buffer and transferred in one NIXL operation to
-        # avoid per-transfer overhead.
-        large_tensors: dict[str, torch.Tensor] = {}
-        small_entries: list[tuple[str, torch.Tensor]] = []
-        for name, tensor in local_tensors.items():
-            nbytes = tensor.nelement() * tensor.element_size()
-            if nbytes < _COALESCE_THRESHOLD:
-                small_entries.append((name, tensor))
-            else:
-                large_tensors[name] = tensor
+        # Register chunk buffers with NIXL (not individual tensors).
+        # 8 contiguous regions pin in ~200ms vs ~5.3s for 258 scattered ones.
+        chunk_dict = {f"__chunk_{i}__": buf for i, buf in enumerate(alloc.buffers)}
+        agent.register_vram(chunk_dict)
 
-        # Only register large tensors with NIXL (they receive data directly).
-        # Small tensors receive via the coalesce buffer, so skip their
-        # individual registration to save ~3s.
-        agent.register_vram(large_tensors)
+        # Pin chunk buffers at module level so GC can't free them while
+        # the NIXL registration is active.
+        _CHUNK_BUFFERS.extend(alloc.buffers)
 
         handles: list[tuple[str, object]] = []
 
@@ -696,6 +736,106 @@ def _discover_via_index(model_name: str, revision: str, hf_endpoint: str) -> lis
 
     weight_map = index.get("weight_map", {})
     return sorted(set(weight_map.values()))
+
+
+@dataclasses.dataclass
+class _ChunkedAllocation:
+    """Result of allocating tensors into contiguous chunk buffers."""
+
+    # name -> view tensor (points into a chunk buffer)
+    views: dict[str, torch.Tensor]
+    # The underlying chunk buffers (keep alive to prevent GC)
+    buffers: list[torch.Tensor]
+
+
+def _next_power_of_2(n: int) -> int:
+    """Round up to the next power of 2 (minimum 1)."""
+    if n <= 1:
+        return 1
+    return 1 << (n - 1).bit_length()
+
+
+def _allocate_chunked(
+    specs: list[tuple[str, torch.Size, torch.dtype]],
+    device: str,
+    chunk_target_bytes: int,
+) -> _ChunkedAllocation:
+    """Allocate tensors into a small number of contiguous VRAM buffers.
+
+    Groups tensors by dtype, then splits each group into chunks. Each chunk
+    is one contiguous allocation, and individual tensors are views into it.
+    This reduces NIXL register_memory calls from len(specs) to a small power
+    of 2, cutting VRAM pinning time from ~5s to ~200ms.
+
+    The number of chunks is computed dynamically: total_bytes / chunk_target,
+    rounded to the nearest power of 2, clamped to [1, 64].
+
+    Args:
+        specs: (name, shape, dtype) for each tensor to allocate.
+        device: CUDA device string.
+        chunk_target_bytes: target size per chunk in bytes.
+
+    Returns:
+        _ChunkedAllocation with views and backing buffers.
+    """
+    if not specs:
+        return _ChunkedAllocation(views={}, buffers=[])
+
+    # Group by dtype (can't mix dtypes in a single contiguous buffer)
+    by_dtype: dict[torch.dtype, list[tuple[str, torch.Size]]] = {}
+    for name, shape, dtype in specs:
+        by_dtype.setdefault(dtype, []).append((name, shape))
+
+    # Compute total bytes to determine chunk count
+    total_bytes = 0
+    for dt, entries in by_dtype.items():
+        elem_size = torch.tensor([], dtype=dt).element_size()
+        total_bytes += sum(s.numel() * elem_size for _, s in entries)
+
+    num_chunks = _next_power_of_2(max(1, total_bytes // chunk_target_bytes))
+    num_chunks = min(num_chunks, 64)
+
+    # Distribute chunk budget across dtype groups proportionally
+    chunks_per_dtype: dict[torch.dtype, int] = {}
+    remaining_chunks = num_chunks
+    dtype_list = list(by_dtype.keys())
+    for i, dt in enumerate(dtype_list):
+        entries = by_dtype[dt]
+        elem_size = torch.tensor([], dtype=dt).element_size()
+        dt_bytes = sum(s.numel() * elem_size for _, s in entries)
+        if i == len(dtype_list) - 1:
+            chunks_per_dtype[dt] = max(1, remaining_chunks)
+        else:
+            n = max(1, round(num_chunks * dt_bytes / total_bytes))
+            chunks_per_dtype[dt] = n
+            remaining_chunks -= n
+
+    views: dict[str, torch.Tensor] = {}
+    buffers: list[torch.Tensor] = []
+
+    for dt, entries in by_dtype.items():
+        n_chunks = min(chunks_per_dtype[dt], len(entries))
+
+        # Split entries into n_chunks groups (round-robin)
+        groups: list[list[tuple[str, torch.Size]]] = [[] for _ in range(n_chunks)]
+        for idx, entry in enumerate(entries):
+            groups[idx % n_chunks].append(entry)
+
+        for group in groups:
+            if not group:
+                continue
+            total_elems = sum(shape.numel() for _, shape in group)
+            chunk_buf = torch.empty(total_elems, dtype=dt, device=device)
+            buffers.append(chunk_buf)
+
+            offset = 0
+            for name, shape in group:
+                numel = shape.numel()
+                view = chunk_buf[offset : offset + numel].view(shape)
+                views[name] = view
+                offset += numel
+
+    return _ChunkedAllocation(views=views, buffers=buffers)
 
 
 def _parse_torch_dtype(dtype_str: str | None, fallback: "torch.dtype") -> "torch.dtype":
