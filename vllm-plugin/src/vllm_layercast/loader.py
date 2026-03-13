@@ -76,6 +76,7 @@ class LayercastModelLoader(BaseModelLoader):
         self._backend: RustSidecarBackend | None = None
         self._backend_loop: asyncio.AbstractEventLoop | None = None
         self._weight_files_cache: dict[str, list[str]] = {}
+        self._weight_map: dict[str, str] = {}  # tensor name -> shard file
         # The fallback needs load_format="auto" (safetensors/HF), not "layercast"
         fallback_config = dataclasses.replace(load_config, load_format="auto")
         self._fallback = DefaultModelLoader(fallback_config)
@@ -558,8 +559,11 @@ class LayercastModelLoader(BaseModelLoader):
                     "prepare_model_ok",
                     files=len(prepared.files),
                     peers=len(prepared.peers),
+                    weight_map=len(prepared.weight_map),
                     model=repo_id,
                 )
+            if prepared.weight_map:
+                self._weight_map = dict(prepared.weight_map)
             return prepared
         except Exception as exc:
             log.debug("prepare_model_failed", error=str(exc))
@@ -568,9 +572,10 @@ class LayercastModelLoader(BaseModelLoader):
     def _get_weight_files(self, model_config: ModelConfig) -> list[str]:
         """Cached weight file discovery.
 
-        Tries three strategies:
-        1. Local directory (NFS, shared FS, etc.)
-        2. Query the HF model info API directly
+        Tries four strategies:
+        0. Local directory (NFS, shared FS, etc.)
+        1. Derive from cached weight_map (populated by prepare_model)
+        2. Query the HF model info API
         3. Fetch the safetensors index file
 
         Note: the backend's prepare_model() is the primary path (called from
@@ -605,7 +610,17 @@ class LayercastModelLoader(BaseModelLoader):
                 self._weight_files_cache[key] = local_files
                 return local_files
 
-        # Strategy 1: query HF model info API directly
+        # Strategy 1: derive from cached weight_map (populated by prepare_model)
+        if self._weight_map:
+            wm_files = sorted(set(self._weight_map.values()))
+            if wm_files:
+                log.info(
+                    "weight_files_discovered", source="weight_map", count=len(wm_files)
+                )
+                self._weight_files_cache[key] = wm_files
+                return wm_files
+
+        # Strategy 2: query HF model info API
         hf_endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
         try:
             files = _discover_via_hf_api(model_name, revision, hf_endpoint)
@@ -614,7 +629,7 @@ class LayercastModelLoader(BaseModelLoader):
         except Exception as exc:
             log.debug("hf_api_unavailable", error=str(exc))
 
-        # Strategy 2: fetch the safetensors index file
+        # Strategy 3: fetch the safetensors index file
         if not files:
             try:
                 files = _discover_via_index(model_name, revision, hf_endpoint)

@@ -149,6 +149,45 @@ class TestRustSidecarBackend:
             await server.wait_closed()
 
     @pytest.mark.asyncio
+    async def test_prepare_model_with_weight_map(self, socket_path: str) -> None:
+        """prepare_model returns Prepared with weight_map."""
+        server = await _fake_daemon(
+            socket_path,
+            [
+                IpcResponse(
+                    prepared=Prepared(
+                        files=[
+                            "model-00001-of-00002.safetensors",
+                            "model-00002-of-00002.safetensors",
+                        ],
+                        peers=[],
+                        weight_map={
+                            "layers.0.weight": "model-00001-of-00002.safetensors",
+                            "layers.1.weight": "model-00002-of-00002.safetensors",
+                        },
+                    )
+                ),
+            ],
+        )
+        try:
+            backend = RustSidecarBackend(socket_path=socket_path)
+            await backend.start()
+            prepared = await backend.prepare_model("org/model", "main", 0)
+            assert len(prepared.weight_map) == 2
+            assert (
+                prepared.weight_map["layers.0.weight"]
+                == "model-00001-of-00002.safetensors"
+            )
+            assert (
+                prepared.weight_map["layers.1.weight"]
+                == "model-00002-of-00002.safetensors"
+            )
+            await backend.stop()
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    @pytest.mark.asyncio
     async def test_model_loaded(self, socket_path: str) -> None:
         """model_loaded sends to daemon without error."""
         server = await _fake_daemon(

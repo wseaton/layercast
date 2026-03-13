@@ -97,13 +97,31 @@ async fn write_response(stream: &mut UnixStream, msg: &proto::IpcResponse) -> Re
     Ok(())
 }
 
-// File list cache (populated by predictive prefetch)
+// File list + weight map cache (populated by predictive prefetch)
 
-/// Pre-fetched file lists, keyed by "model_id@revision".
+/// Cached model metadata: safetensor file list + optional weight_map
+/// from `model.safetensors.index.json`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CachedModelInfo {
+    pub files: Vec<String>,
+    pub weight_map: HashMap<String, String>,
+}
+
+impl CachedModelInfo {
+    /// Create a CachedModelInfo with just files (no weight_map).
+    pub fn from_files(files: Vec<String>) -> Self {
+        Self {
+            files,
+            weight_map: HashMap::new(),
+        }
+    }
+}
+
+/// Pre-fetched model info, keyed by "model_id@revision".
 /// Populated at startup if MODEL_NAME is set, otherwise filled lazily.
 #[derive(Clone, Default)]
 pub struct FileListCache {
-    inner: Arc<RwLock<HashMap<String, Vec<String>>>>,
+    inner: Arc<RwLock<HashMap<String, CachedModelInfo>>>,
 }
 
 impl FileListCache {
@@ -115,7 +133,7 @@ impl FileListCache {
         format!("{model_id}@{revision}")
     }
 
-    pub async fn get(&self, model_id: &str, revision: &str) -> Option<Vec<String>> {
+    pub async fn get(&self, model_id: &str, revision: &str) -> Option<CachedModelInfo> {
         self.inner
             .read()
             .await
@@ -123,11 +141,11 @@ impl FileListCache {
             .cloned()
     }
 
-    pub async fn insert(&self, model_id: &str, revision: &str, files: Vec<String>) {
+    pub async fn insert(&self, model_id: &str, revision: &str, info: CachedModelInfo) {
         self.inner
             .write()
             .await
-            .insert(Self::cache_key(model_id, revision), files);
+            .insert(Self::cache_key(model_id, revision), info);
     }
 }
 
@@ -418,9 +436,9 @@ impl IpcServer {
     ) -> (proto::IpcResponse, ConnectionState) {
         info!(model_id, revision, tp_rank, "PrepareModel: starting");
 
-        // Step 1: Get file list (from cache or HF API).
-        let files = match self.get_model_files(&model_id, &revision).await {
-            Ok(f) => f,
+        // Step 1: Get file list + weight map (from cache or HF API).
+        let model_info = match self.get_model_info(&model_id, &revision).await {
+            Ok(info) => info,
             Err(e) => {
                 return (
                     proto::IpcResponse {
@@ -440,8 +458,9 @@ impl IpcServer {
             model_id,
             revision,
             tp_rank,
-            file_count = files.len(),
+            file_count = model_info.files.len(),
             peer_count = peers.len(),
+            weight_map_entries = model_info.weight_map.len(),
             "PrepareModel: complete"
         );
 
@@ -450,9 +469,9 @@ impl IpcServer {
         (
             proto::IpcResponse {
                 msg: Some(proto::ipc_response::Msg::Prepared(proto::Prepared {
-                    files,
+                    files: model_info.files,
                     peers,
-                    weight_map: HashMap::new(),
+                    weight_map: model_info.weight_map,
                     transfer_plan: Vec::new(),
                 })),
             },
@@ -516,35 +535,39 @@ impl IpcServer {
         );
     }
 
-    /// Get safetensor files for a model, checking the prefetch cache first.
-    async fn get_model_files(
+    /// Get model info (files + weight_map), checking the prefetch cache first.
+    pub async fn get_model_info(
         &self,
         model_id: &str,
         revision: &str,
-    ) -> Result<Vec<String>, IpcError> {
+    ) -> Result<CachedModelInfo, IpcError> {
         // Check cache first (populated by predictive prefetch or previous PrepareModel)
         if let Some(cached) = self.file_cache.get(model_id, revision).await {
             debug!(
                 model_id,
                 revision,
-                count = cached.len(),
-                "file list cache hit"
+                files = cached.files.len(),
+                weight_map = cached.weight_map.len(),
+                "model info cache hit"
             );
             return Ok(cached);
         }
 
         // Cache miss: fetch from HF API
         let files = self.fetch_model_files_from_hf(model_id, revision).await?;
+        let weight_map = self.fetch_weight_map(model_id, revision).await;
+        let info = CachedModelInfo { files, weight_map };
         self.file_cache
-            .insert(model_id, revision, files.clone())
+            .insert(model_id, revision, info.clone())
             .await;
         debug!(
             model_id,
             revision,
-            count = files.len(),
-            "file list fetched from HF API and cached"
+            files = info.files.len(),
+            weight_map = info.weight_map.len(),
+            "model info fetched from HF API and cached"
         );
-        Ok(files)
+        Ok(info)
     }
 
     async fn fetch_model_files_from_hf(
@@ -566,6 +589,54 @@ impl IpcServer {
             .cloned()
             .collect();
         Ok(files)
+    }
+
+    /// Fetch `model.safetensors.index.json` and extract the weight_map.
+    ///
+    /// Returns an empty HashMap on any failure (single-shard models don't have
+    /// this file, 404 is expected). Never blocks PrepareModel on failure.
+    async fn fetch_weight_map(&self, model_id: &str, revision: &str) -> HashMap<String, String> {
+        let repo = self.hf_api.repo(hf_hub::Repo::with_revision(
+            model_id.to_string(),
+            hf_hub::RepoType::Model,
+            revision.to_string(),
+        ));
+
+        let index_path = match repo.download("model.safetensors.index.json").await {
+            Ok(path) => path,
+            Err(e) => {
+                debug!(model_id, error = %e, "no safetensors index (single-shard model?)");
+                return HashMap::new();
+            }
+        };
+
+        let contents = match tokio::fs::read_to_string(&index_path).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(model_id, error = %e, "failed to read safetensors index");
+                return HashMap::new();
+            }
+        };
+
+        #[derive(serde::Deserialize)]
+        struct SafetensorsIndex {
+            weight_map: HashMap<String, String>,
+        }
+
+        match serde_json::from_str::<SafetensorsIndex>(&contents) {
+            Ok(index) => {
+                debug!(
+                    model_id,
+                    entries = index.weight_map.len(),
+                    "parsed safetensors index weight_map"
+                );
+                index.weight_map
+            }
+            Err(e) => {
+                warn!(model_id, error = %e, "failed to parse safetensors index JSON");
+                HashMap::new()
+            }
+        }
     }
 
     /// Discover model peers for a given model + TP rank and fetch their metadata.
@@ -674,12 +745,15 @@ impl IpcServer {
 
 #[cfg(test)]
 mod tests {
-    use crate::ipc::{FileListCache, IpcServer};
-    use crate::nixl_vram_store::ModelPeerStore;
-    use crate::proto;
-    use prost::Message;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
+
+    use prost::Message;
+
+    use crate::ipc::{CachedModelInfo, FileListCache, IpcServer};
+    use crate::nixl_vram_store::ModelPeerStore;
+    use crate::proto;
 
     use discovery::{MockDiscovery, PeerDiscovery};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -893,10 +967,15 @@ mod tests {
         assert!(cache.get("m", "main").await.is_none());
 
         cache
-            .insert("m", "main", vec!["a.safetensors".into()])
+            .insert(
+                "m",
+                "main",
+                CachedModelInfo::from_files(vec!["a.safetensors".into()]),
+            )
             .await;
-        let files = cache.get("m", "main").await.unwrap();
-        assert_eq!(files, vec!["a.safetensors"]);
+        let info = cache.get("m", "main").await.unwrap();
+        assert_eq!(info.files, vec!["a.safetensors"]);
+        assert!(info.weight_map.is_empty());
 
         // Different revision is a miss
         assert!(cache.get("m", "dev").await.is_none());
@@ -950,7 +1029,11 @@ mod tests {
 
         server
             .file_cache()
-            .insert("test/model", "main", vec!["shard-001.safetensors".into()])
+            .insert(
+                "test/model",
+                "main",
+                CachedModelInfo::from_files(vec!["shard-001.safetensors".into()]),
+            )
             .await;
 
         let handle = Arc::clone(&server).start().unwrap();
@@ -1059,7 +1142,11 @@ mod tests {
 
         server
             .file_cache()
-            .insert("test/model", "main", vec!["shard.safetensors".into()])
+            .insert(
+                "test/model",
+                "main",
+                CachedModelInfo::from_files(vec!["shard.safetensors".into()]),
+            )
             .await;
 
         let handle = Arc::clone(&server).start().unwrap();
@@ -1125,11 +1212,19 @@ mod tests {
 
         server
             .file_cache()
-            .insert("model-a", "main", vec!["a.safetensors".into()])
+            .insert(
+                "model-a",
+                "main",
+                CachedModelInfo::from_files(vec!["a.safetensors".into()]),
+            )
             .await;
         server
             .file_cache()
-            .insert("model-b", "main", vec!["b.safetensors".into()])
+            .insert(
+                "model-b",
+                "main",
+                CachedModelInfo::from_files(vec!["b.safetensors".into()]),
+            )
             .await;
 
         let handle = Arc::clone(&server).start().unwrap();
@@ -1178,10 +1273,10 @@ mod tests {
             .insert(
                 "org/model",
                 "v1",
-                vec![
+                CachedModelInfo::from_files(vec![
                     "shard-001.safetensors".into(),
                     "shard-002.safetensors".into(),
-                ],
+                ]),
             )
             .await;
 
@@ -1196,6 +1291,99 @@ mod tests {
                 assert_eq!(p.files.len(), 2);
                 assert!(p.files.contains(&"shard-001.safetensors".to_string()));
                 assert!(p.files.contains(&"shard-002.safetensors".to_string()));
+            }
+            other => panic!("expected Prepared, got {other:?}"),
+        }
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn prepare_model_includes_weight_map() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(tmp.path()).await;
+
+        let mut weight_map = HashMap::new();
+        weight_map.insert(
+            "model.layers.0.self_attn.q_proj.weight".to_string(),
+            "model-00001-of-00002.safetensors".to_string(),
+        );
+        weight_map.insert(
+            "model.layers.1.self_attn.q_proj.weight".to_string(),
+            "model-00002-of-00002.safetensors".to_string(),
+        );
+
+        server
+            .file_cache()
+            .insert(
+                "org/model",
+                "v1",
+                CachedModelInfo {
+                    files: vec![
+                        "model-00001-of-00002.safetensors".into(),
+                        "model-00002-of-00002.safetensors".into(),
+                    ],
+                    weight_map: weight_map.clone(),
+                },
+            )
+            .await;
+
+        let handle = Arc::clone(&server).start().unwrap();
+        let mut stream = UnixStream::connect(server.socket_path()).await.unwrap();
+
+        send_request(&mut stream, &make_prepare_model("org/model", "v1", 0)).await;
+        let resp = recv_response(&mut stream).await;
+
+        match resp.msg.unwrap() {
+            proto::ipc_response::Msg::Prepared(p) => {
+                assert_eq!(p.files.len(), 2);
+                assert_eq!(p.weight_map.len(), 2);
+                assert_eq!(
+                    p.weight_map["model.layers.0.self_attn.q_proj.weight"],
+                    "model-00001-of-00002.safetensors"
+                );
+                assert_eq!(
+                    p.weight_map["model.layers.1.self_attn.q_proj.weight"],
+                    "model-00002-of-00002.safetensors"
+                );
+            }
+            other => panic!("expected Prepared, got {other:?}"),
+        }
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn prepare_model_empty_weight_map_for_single_shard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(tmp.path()).await;
+
+        server
+            .file_cache()
+            .insert(
+                "org/small-model",
+                "main",
+                CachedModelInfo::from_files(vec!["model.safetensors".into()]),
+            )
+            .await;
+
+        let handle = Arc::clone(&server).start().unwrap();
+        let mut stream = UnixStream::connect(server.socket_path()).await.unwrap();
+
+        send_request(
+            &mut stream,
+            &make_prepare_model("org/small-model", "main", 0),
+        )
+        .await;
+        let resp = recv_response(&mut stream).await;
+
+        match resp.msg.unwrap() {
+            proto::ipc_response::Msg::Prepared(p) => {
+                assert_eq!(p.files.len(), 1);
+                assert!(
+                    p.weight_map.is_empty(),
+                    "single-shard models should have empty weight_map"
+                );
             }
             other => panic!("expected Prepared, got {other:?}"),
         }
@@ -1221,7 +1409,11 @@ mod tests {
         // Should still be in Connected state, so PrepareModel again should work
         server
             .file_cache()
-            .insert("org/model", "main", vec!["f.safetensors".into()])
+            .insert(
+                "org/model",
+                "main",
+                CachedModelInfo::from_files(vec!["f.safetensors".into()]),
+            )
             .await;
         send_request(&mut stream, &make_prepare_model("org/model", "main", 0)).await;
         let resp = recv_response(&mut stream).await;

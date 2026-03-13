@@ -61,33 +61,21 @@ async fn main() -> Result<()> {
         file_cache.clone(),
         Duration::from_secs(config.peer_discovery_timeout),
     ));
-    let _ipc_handle = ipc_server.start()?;
-    info!(path = %config.ipc_socket_path.display(), "IPC server listening");
-
-    // if MODEL_NAME is set, pre-fetch the file list
+    // if MODEL_NAME is set, pre-fetch the file list + weight map
     // from HF API so the first PrepareModel is a cache hit.
     if let Some(ref model_name) = config.model_name {
         let model = model_name.clone();
-        let hf_api = hf_api.clone();
-        let cache = file_cache.clone();
+        let ipc = Arc::clone(&ipc_server);
         tokio::spawn(async move {
-            info!(model = %model, "predictive prefetch: fetching file list");
-            let repo = hf_api.model(model.clone());
-            match repo.info().await {
+            info!(model = %model, "predictive prefetch: fetching file list + weight map");
+            match ipc.get_model_info(&model, "main").await {
                 Ok(info) => {
-                    let files: Vec<String> = info
-                        .siblings
-                        .iter()
-                        .map(|s| &s.rfilename)
-                        .filter(|f| f.ends_with(".safetensors"))
-                        .cloned()
-                        .collect();
                     info!(
                         model = %model,
-                        file_count = files.len(),
-                        "predictive prefetch: file list cached"
+                        file_count = info.files.len(),
+                        weight_map_entries = info.weight_map.len(),
+                        "predictive prefetch: cached"
                     );
-                    cache.insert(&model, "main", files).await;
                 }
                 Err(e) => {
                     warn!(
@@ -99,6 +87,9 @@ async fn main() -> Result<()> {
             }
         });
     }
+
+    let _ipc_handle = ipc_server.start()?;
+    info!(path = %config.ipc_socket_path.display(), "IPC server listening");
 
     // Compile cache: optionally start the RESP server + store
     let compile_cache = if config.compile_cache_enabled {

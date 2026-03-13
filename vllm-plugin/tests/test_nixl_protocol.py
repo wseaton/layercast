@@ -212,6 +212,41 @@ class TestIpcWireFormat:
         assert decoded.prepared.peers[0].nixl_md == b"\xca\xfe\xba\xbe"
         assert len(decoded.prepared.peers[0].tensors) == 1
 
+    def test_prepared_response_with_weight_map(self) -> None:
+        """Prepared response carries weight_map for multi-shard models."""
+        resp = IpcResponse(
+            prepared=Prepared(
+                files=[
+                    "model-00001-of-00002.safetensors",
+                    "model-00002-of-00002.safetensors",
+                ],
+                peers=[],
+                weight_map={
+                    "model.layers.0.self_attn.q_proj.weight": "model-00001-of-00002.safetensors",
+                    "model.layers.1.self_attn.q_proj.weight": "model-00002-of-00002.safetensors",
+                },
+            )
+        )
+        wire = bytes(resp)
+        decoded = decode_response(wire)
+        assert len(decoded.prepared.weight_map) == 2
+        assert (
+            decoded.prepared.weight_map["model.layers.0.self_attn.q_proj.weight"]
+            == "model-00001-of-00002.safetensors"
+        )
+
+    def test_prepared_response_empty_weight_map(self) -> None:
+        """Single-shard models have empty weight_map (proto3 default)."""
+        resp = IpcResponse(
+            prepared=Prepared(
+                files=["model.safetensors"],
+                peers=[],
+            )
+        )
+        wire = bytes(resp)
+        decoded = decode_response(wire)
+        assert decoded.prepared.weight_map == {}
+
     def test_model_id_no_revision(self) -> None:
         """Verify model_id uses bare repo_id (no @revision suffix)."""
         msg = IpcRequest(
