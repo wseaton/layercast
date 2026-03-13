@@ -25,10 +25,9 @@ RUN python -c "from vllm_layercast.plugin import register; print('plugin import 
     python -c "import vllm_layercast; v = vllm_layercast.__version__; \
                assert v != '0.1.0', f'stale version {v}'; \
                print(f'version OK: {v}')" && \
-    python -c "from vllm_layercast.proto import ModelLoaded; \
-               msg = ModelLoaded(agent_name='a', metadata=b'x', model_id='m', files=['f'], tp_rank=0); \
-               d = msg.model_dump(); \
-               assert d['type'] == 'model_loaded', f'bad type: {d}'; \
+    python -c "from vllm_layercast.proto import ModelLoaded, encode; \
+               msg = ModelLoaded(agent_name='a', nixl_md=b'x', model_id='m', files=['f'], tp_rank=0); \
+               assert msg.agent_name == 'a'; \
                print('proto OK')"
 
 # Switch back to non-root

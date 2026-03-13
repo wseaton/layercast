@@ -5,6 +5,7 @@ RUN dnf install -y \
     openssl-devel \
     perl \
     make \
+    protobuf-compiler \
     && dnf clean all
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
@@ -12,10 +13,13 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 
 WORKDIR /build
 
-# Cache deps: copy manifests first
+# Cache deps: copy manifests and proto schema first
 COPY Cargo.toml Cargo.lock ./
+COPY proto/ proto/
 COPY crates/discovery/Cargo.toml crates/discovery/Cargo.toml
 COPY crates/model-mesh/Cargo.toml crates/model-mesh/Cargo.toml
+
+COPY crates/model-mesh/build.rs crates/model-mesh/build.rs
 
 RUN for crate in discovery model-mesh; do \
     mkdir -p crates/$crate/src && echo "" > crates/$crate/src/lib.rs; \
