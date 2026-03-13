@@ -22,7 +22,7 @@ resources:
 images:
   - name: model-mesh
     newName: ghcr.io/wseaton/layercast
-    newTag: model-mesh-v25
+    newTag: model-mesh-main
   - name: vllm-plugin
     newName: ghcr.io/wseaton/layercast
-    newTag: vllm-plugin-v24
+    newTag: vllm-plugin-main

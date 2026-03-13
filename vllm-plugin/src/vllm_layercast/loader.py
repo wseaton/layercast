@@ -238,9 +238,11 @@ class LayercastModelLoader(BaseModelLoader):
             return False
 
         if prepared.transfer_plan:
-            return self._nixl_load_multi_peer(model, agent, prepared, weight_files)
+            return self._nixl_load_multi_peer(
+                model, agent, prepared, weight_files, repo_id, revision
+            )
         return self._nixl_load_single_peer(
-            model, agent, prepared.peers[0], weight_files
+            model, agent, prepared.peers[0], weight_files, repo_id, revision
         )
 
     def _nixl_load_single_peer(
@@ -249,6 +251,8 @@ class LayercastModelLoader(BaseModelLoader):
         agent: VramNixlAgent,
         peer: PeerNixlMd,
         weight_files: list[str],
+        repo_id: str,
+        revision: str,
     ) -> bool:
         """Transfer all weights from a single peer via NIXL GPUDirect."""
         log.info(
@@ -289,7 +293,12 @@ class LayercastModelLoader(BaseModelLoader):
                 peer=peer_name,
             )
             if not _fallback_tensors_from_disk(
-                failed, local_tensors, self._weight_map, weight_files
+                failed,
+                local_tensors,
+                self._weight_map,
+                weight_files,
+                repo_id,
+                revision,
             ):
                 return False
 
@@ -305,6 +314,8 @@ class LayercastModelLoader(BaseModelLoader):
         agent: VramNixlAgent,
         prepared: Prepared,
         weight_files: list[str],
+        repo_id: str,
+        revision: str,
     ) -> bool:
         """Transfer weights from multiple peers using the scheduler's plan.
 
@@ -385,7 +396,12 @@ class LayercastModelLoader(BaseModelLoader):
                 total=len(local_tensors),
             )
             if not _fallback_tensors_from_disk(
-                all_failed, local_tensors, self._weight_map, weight_files
+                all_failed,
+                local_tensors,
+                self._weight_map,
+                weight_files,
+                repo_id,
+                revision,
             ):
                 return False
 
@@ -807,6 +823,8 @@ def _fallback_tensors_from_disk(
     local_tensors: dict[str, "torch.Tensor"],
     weight_map: dict[str, str],
     weight_files: list[str],
+    repo_id: str = "",
+    revision: str = "main",
 ) -> bool:
     """Load specific tensors from safetensors files on disk.
 
@@ -843,7 +861,7 @@ def _fallback_tensors_from_disk(
     for shard_file, tensor_names in file_to_tensors.items():
         # Resolve the shard file path. Try HF cache first, then check
         # if it's already an absolute path.
-        shard_path = _resolve_shard_path(shard_file)
+        shard_path = _resolve_shard_path(shard_file, repo_id, revision)
         if shard_path is None:
             log.warning("shard_file_not_found", file=shard_file)
             continue
@@ -876,7 +894,9 @@ def _fallback_tensors_from_disk(
     return success
 
 
-def _resolve_shard_path(shard_file: str) -> str | None:
+def _resolve_shard_path(
+    shard_file: str, repo_id: str, revision: str = "main"
+) -> str | None:
     """Find the local path for a safetensors shard file.
 
     Checks HF cache via huggingface_hub, then looks for it as an absolute path.
@@ -884,12 +904,14 @@ def _resolve_shard_path(shard_file: str) -> str | None:
     if os.path.isfile(shard_file):
         return shard_file
 
-    cached = try_to_load_from_cache(
-        repo_id="",  # we don't know the repo_id here
-        filename=shard_file,
-    )
-    if cached and os.path.isfile(cached):
-        return cached
+    if repo_id:
+        cached = try_to_load_from_cache(
+            repo_id=repo_id,
+            filename=shard_file,
+            revision=revision,
+        )
+        if cached and os.path.isfile(cached):
+            return cached
     return None
 
 

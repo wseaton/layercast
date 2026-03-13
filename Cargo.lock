@@ -483,7 +483,7 @@ dependencies = [
 
 [[package]]
 name = "discovery"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -1518,7 +1518,7 @@ dependencies = [
 
 [[package]]
 name = "model-mesh"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",

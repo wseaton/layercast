@@ -63,8 +63,8 @@ jobs:
           tags: |
             type=sha,prefix=model-mesh-
             type=ref,event=branch,prefix=model-mesh-
-            type=semver,pattern=model-mesh-v{{version}}
-            type=semver,pattern=model-mesh-v{{major}}.{{minor}}
+            type=semver,pattern={{version}},prefix=model-mesh-v
+            type=semver,pattern={{major}}.{{minor}},prefix=model-mesh-v
       - uses: docker/build-push-action@v5
         with:
           context: .
@@ -106,8 +106,8 @@ jobs:
           tags: |
             type=sha,prefix=vllm-plugin-
             type=ref,event=branch,prefix=vllm-plugin-
-            type=semver,pattern=vllm-plugin-v{{version}}
-            type=semver,pattern=vllm-plugin-v{{major}}.{{minor}}
+            type=semver,pattern={{version}},prefix=vllm-plugin-v
+            type=semver,pattern={{major}}.{{minor}},prefix=vllm-plugin-v
       - uses: docker/build-push-action@v5
         with:
           context: .

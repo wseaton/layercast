@@ -17,8 +17,8 @@ resources:
 
 images:
   - name: model-mesh
-    newName: ghcr.io/wseaton/layercast
-    newTag: model-mesh-v25
+    newName: quay.io/wseaton/layercast
+    newTag: model-mesh-chunked
   - name: vllm-plugin
-    newName: ghcr.io/wseaton/layercast
-    newTag: vllm-plugin-v24
+    newName: quay.io/wseaton/layercast
+    newTag: vllm-plugin-chunked

@@ -9,3 +9,4 @@ target/
 *.pyc
 benchmark-logs/
 .ruff_cache/
+__pycache__/
