@@ -1,6 +1,7 @@
 """Tests for the RustSidecarBackend.
 
 Uses real Unix sockets with a fake daemon to verify actual IPC round-trips.
+The fake daemon speaks the protobuf wire protocol (length-prefixed proto).
 """
 
 from __future__ import annotations
@@ -10,19 +11,25 @@ import os
 import struct
 import tempfile
 
-import msgpack
 import pytest
 
 from vllm_layercast.backend_rust import RustSidecarBackend
+from vllm_layercast.proto import (
+    Error,
+    IpcResponse,
+    Ok,
+    PeerNixlMd,
+    Prepared,
+)
 
 
-# Fake daemon: a real Unix socket server that speaks the wire protocol
+# Fake daemon: a real Unix socket server that speaks the protobuf wire protocol
 
 
 async def _fake_daemon(
-    socket_path: str, responses: list[dict]
+    socket_path: str, responses: list[IpcResponse]
 ) -> asyncio.AbstractServer:
-    """Start a Unix socket server that replies with pre-canned responses.
+    """Start a Unix socket server that replies with pre-canned protobuf responses.
 
     Each client connection gets the next response from the list.
     Returns the server so the caller can close it.
@@ -43,9 +50,9 @@ async def _fake_daemon(
                 try:
                     resp = next(response_iter)
                 except StopIteration:
-                    resp = {"type": "ok"}
+                    resp = IpcResponse(ok=Ok())
 
-                payload = msgpack.packb(resp, use_bin_type=True)
+                payload = bytes(resp)
                 writer.write(struct.pack(">I", len(payload)) + payload)
                 await writer.drain()
         except (asyncio.IncompleteReadError, ConnectionResetError):
@@ -112,29 +119,30 @@ class TestRustSidecarBackend:
 
     @pytest.mark.asyncio
     async def test_prepare_model(self, socket_path: str) -> None:
-        """prepare_model returns files and peers from daemon."""
+        """prepare_model returns Prepared from daemon."""
         server = await _fake_daemon(
             socket_path,
             [
-                {
-                    "type": "prepared",
-                    "files": ["shard-001.safetensors", "shard-002.safetensors"],
-                    "peers": [
-                        {"agent_name": "peer-0", "metadata": b"\xde\xad"},
-                        {"agent_name": "peer-1", "metadata": b"\xbe\xef"},
-                    ],
-                },
+                IpcResponse(
+                    prepared=Prepared(
+                        files=["shard-001.safetensors", "shard-002.safetensors"],
+                        peers=[
+                            PeerNixlMd(agent_name="peer-0", nixl_md=b"\xde\xad"),
+                            PeerNixlMd(agent_name="peer-1", nixl_md=b"\xbe\xef"),
+                        ],
+                    )
+                ),
             ],
         )
         try:
             backend = RustSidecarBackend(socket_path=socket_path)
             await backend.start()
-            files, peers = await backend.prepare_model("org/model", "main", 0)
-            assert files == ["shard-001.safetensors", "shard-002.safetensors"]
-            assert len(peers) == 2
-            assert peers[0].agent_name == "peer-0"
-            assert peers[0].metadata == b"\xde\xad"
-            assert peers[1].agent_name == "peer-1"
+            prepared = await backend.prepare_model("org/model", "main", 0)
+            assert prepared.files == ["shard-001.safetensors", "shard-002.safetensors"]
+            assert len(prepared.peers) == 2
+            assert prepared.peers[0].agent_name == "peer-0"
+            assert prepared.peers[0].nixl_md == b"\xde\xad"
+            assert prepared.peers[1].agent_name == "peer-1"
             await backend.stop()
         finally:
             server.close()
@@ -145,16 +153,15 @@ class TestRustSidecarBackend:
         """model_loaded sends to daemon without error."""
         server = await _fake_daemon(
             socket_path,
-            [
-                {"type": "ok"},
-            ],
+            [IpcResponse(ok=Ok())],
         )
         try:
             backend = RustSidecarBackend(socket_path=socket_path)
             await backend.start()
             await backend.model_loaded(
                 agent_name="test-agent",
-                metadata=b"\x00\x01\x02",
+                nixl_md=b"\x00\x01\x02",
+                tensors=[],
                 model_id="org/model",
                 files=["shard.safetensors"],
                 tp_rank=0,
@@ -169,9 +176,7 @@ class TestRustSidecarBackend:
         """model_unloaded sends to daemon without error."""
         server = await _fake_daemon(
             socket_path,
-            [
-                {"type": "ok"},
-            ],
+            [IpcResponse(ok=Ok())],
         )
         try:
             backend = RustSidecarBackend(socket_path=socket_path)
@@ -187,9 +192,7 @@ class TestRustSidecarBackend:
         """prepare_model raises RuntimeError on error response."""
         server = await _fake_daemon(
             socket_path,
-            [
-                {"type": "error", "message": "HF API unreachable"},
-            ],
+            [IpcResponse(error=Error(message="HF API unreachable"))],
         )
         try:
             backend = RustSidecarBackend(socket_path=socket_path)
@@ -207,26 +210,28 @@ class TestRustSidecarBackend:
         server = await _fake_daemon(
             socket_path,
             [
-                {
-                    "type": "prepared",
-                    "files": ["shard.safetensors"],
-                    "peers": [],
-                },
-                {"type": "ok"},  # model_loaded
-                {"type": "ok"},  # model_unloaded
+                IpcResponse(
+                    prepared=Prepared(
+                        files=["shard.safetensors"],
+                        peers=[],
+                    )
+                ),
+                IpcResponse(ok=Ok()),  # model_loaded
+                IpcResponse(ok=Ok()),  # model_unloaded
             ],
         )
         try:
             backend = RustSidecarBackend(socket_path=socket_path)
             await backend.start()
 
-            files, peers = await backend.prepare_model("org/model", "main", 0)
-            assert files == ["shard.safetensors"]
-            assert peers == []
+            prepared = await backend.prepare_model("org/model", "main", 0)
+            assert prepared.files == ["shard.safetensors"]
+            assert prepared.peers == []
 
             await backend.model_loaded(
                 agent_name="agent-0",
-                metadata=b"\xca\xfe",
+                nixl_md=b"\xca\xfe",
+                tensors=[],
                 model_id="org/model",
                 files=["shard.safetensors"],
                 tp_rank=0,

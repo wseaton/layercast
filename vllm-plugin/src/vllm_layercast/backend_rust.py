@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from vllm_layercast.daemon_client import DaemonClient
 from vllm_layercast.log import get_logger
-from vllm_layercast.proto import PeerNixlMd
+from vllm_layercast.proto import Prepared, TensorInfo
 
 log = get_logger("vllm_layercast.backend_rust")
 
@@ -41,14 +41,19 @@ class RustSidecarBackend:
         model_id: str,
         revision: str,
         tp_rank: int,
-    ) -> tuple[list[str], list[PeerNixlMd]]:
+    ) -> Prepared:
+        """Ask daemon to list files + discover NIXL peers.
+
+        Returns a Prepared message with files, peers, weight_map, and transfer_plan.
+        """
         client = self._ensure_client()
         return await client.prepare_model(model_id, revision, tp_rank)
 
     async def model_loaded(
         self,
         agent_name: str,
-        metadata: bytes,
+        nixl_md: bytes,
+        tensors: list[TensorInfo],
         model_id: str,
         files: list[str],
         tp_rank: int,
@@ -56,7 +61,8 @@ class RustSidecarBackend:
         client = self._ensure_client()
         await client.model_loaded(
             agent_name=agent_name,
-            metadata=metadata,
+            nixl_md=nixl_md,
+            tensors=tensors,
             model_id=model_id,
             files=files,
             tp_rank=tp_rank,

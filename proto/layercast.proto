@@ -1,0 +1,76 @@
+syntax = "proto3";
+package layercast;
+
+// ── Requests (tagged union via oneof) ────────────────────────────────
+
+message IpcRequest {
+  oneof msg {
+    PrepareModel prepare_model = 1;
+    ModelLoaded model_loaded = 2;
+    ModelUnloaded model_unloaded = 3;
+  }
+}
+
+message PrepareModel {
+  string model_id = 1;
+  string revision = 2;
+  uint32 tp_rank = 3;
+}
+
+message ModelLoaded {
+  string agent_name = 1;
+  bytes nixl_md = 2;
+  repeated TensorInfo tensors = 3;
+  string model_id = 4;
+  repeated string files = 5;
+  uint32 tp_rank = 6;
+}
+
+message ModelUnloaded {
+  string agent_name = 1;
+}
+
+// ── Responses (tagged union via oneof) ───────────────────────────────
+
+message IpcResponse {
+  oneof msg {
+    Prepared prepared = 1;
+    Ok ok = 2;
+    Error error = 3;
+  }
+}
+
+message Prepared {
+  repeated string files = 1;
+  repeated PeerNixlMd peers = 2;
+  map<string, string> weight_map = 3;
+  repeated PeerTransferAssignment transfer_plan = 4;
+}
+
+message PeerNixlMd {
+  string agent_name = 1;
+  bytes nixl_md = 2;
+  repeated TensorInfo tensors = 3;
+}
+
+message TensorInfo {
+  string name = 1;
+  uint64 addr = 2;
+  uint64 size = 3;
+  uint32 device_id = 4;
+  string dtype = 5;
+  uint64 checksum = 6;
+}
+
+message PeerTransferAssignment {
+  string agent_name = 1;
+  bytes nixl_md = 2;
+  repeated TensorInfo tensors = 3;
+  repeated string assigned_tensors = 4;
+}
+
+message Ok {}
+
+message Error {
+  string message = 1;
+}

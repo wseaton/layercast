@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use prost::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::RwLock;
@@ -12,6 +12,7 @@ use tracing::{debug, error, info, warn};
 use discovery::PeerDiscovery;
 
 use crate::nixl_vram_store::ModelPeerStore;
+use crate::proto;
 
 /// Errors that can occur in the IPC server and its supporting operations.
 #[derive(Debug, thiserror::Error)]
@@ -19,14 +20,17 @@ pub enum IpcError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("failed to serialize message: {0}")]
-    Serialize(#[from] rmp_serde::encode::Error),
+    #[error("failed to decode protobuf message: {0}")]
+    ProtoDecode(#[from] prost::DecodeError),
 
-    #[error("failed to deserialize message: {0}")]
-    Deserialize(#[from] rmp_serde::decode::Error),
+    #[error("failed to encode protobuf message: {0}")]
+    ProtoEncode(#[from] prost::EncodeError),
 
     #[error("message too large: {size} bytes (max {max})")]
     MessageTooLarge { size: u32, max: u32 },
+
+    #[error("invalid IPC request: missing oneof msg")]
+    MissingMsg,
 
     #[error("HF Hub API error: {0}")]
     HfHub(#[from] hf_hub::api::tokio::ApiError),
@@ -35,7 +39,7 @@ pub enum IpcError {
     TaskJoin(#[from] tokio::task::JoinError),
 }
 
-// Wire protocol messages
+// Per-connection state machine
 //
 // Three request types form a state machine per connection:
 //
@@ -47,62 +51,6 @@ pub enum IpcError {
 
 /// Maximum allowed message size (64 MB).
 const MAX_MESSAGE_SIZE: u32 = 64 * 1024 * 1024;
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum IpcRequest {
-    /// Batch: list model files + discover NIXL peers + fetch metadata.
-    /// Valid in: Connected, Ready (triggers hot-swap unadvertise).
-    #[serde(rename = "prepare_model")]
-    PrepareModel {
-        model_id: String,
-        revision: String,
-        tp_rank: u32,
-    },
-
-    /// Batch: store NIXL metadata + advertise via CRD.
-    /// Valid in: Preparing only.
-    #[serde(rename = "model_loaded")]
-    ModelLoaded {
-        agent_name: String,
-        #[serde(with = "serde_bytes")]
-        metadata: Vec<u8>,
-        model_id: String,
-        files: Vec<String>,
-        tp_rank: u32,
-    },
-
-    /// Explicit teardown: unadvertise + remove metadata.
-    /// Valid in: Ready only.
-    #[serde(rename = "model_unloaded")]
-    ModelUnloaded { agent_name: String },
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum IpcResponse {
-    /// Response to PrepareModel: safetensor file list + peer NIXL metadata.
-    #[serde(rename = "prepared")]
-    Prepared {
-        files: Vec<String>,
-        peers: Vec<PeerNixlMdInfo>,
-    },
-
-    #[serde(rename = "ok")]
-    Ok,
-
-    #[serde(rename = "error")]
-    Error { message: String },
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PeerNixlMdInfo {
-    pub agent_name: String,
-    #[serde(with = "serde_bytes")]
-    pub metadata: Vec<u8>,
-}
-
-// Per-connection state machine
 
 /// Tracks what the client is doing so we can enforce valid transitions
 /// and auto-cleanup on crash (EOF while Ready).
@@ -126,9 +74,9 @@ impl ConnectionState {
     }
 }
 
-// Length-prefixed msgpack helpers
+// Length-prefixed protobuf helpers
 
-async fn read_message<T: DeserializeOwned>(stream: &mut UnixStream) -> Result<T, IpcError> {
+async fn read_request(stream: &mut UnixStream) -> Result<proto::IpcRequest, IpcError> {
     let len = stream.read_u32().await?;
     if len > MAX_MESSAGE_SIZE {
         return Err(IpcError::MessageTooLarge {
@@ -138,11 +86,11 @@ async fn read_message<T: DeserializeOwned>(stream: &mut UnixStream) -> Result<T,
     }
     let mut buf = vec![0u8; len as usize];
     stream.read_exact(&mut buf).await?;
-    Ok(rmp_serde::from_slice(&buf)?)
+    Ok(proto::IpcRequest::decode(buf.as_slice())?)
 }
 
-async fn write_message<T: Serialize>(stream: &mut UnixStream, msg: &T) -> Result<(), IpcError> {
-    let data = rmp_serde::to_vec_named(msg)?;
+async fn write_response(stream: &mut UnixStream, msg: &proto::IpcResponse) -> Result<(), IpcError> {
+    let data = msg.encode_to_vec();
     stream.write_u32(data.len() as u32).await?;
     stream.write_all(&data).await?;
     stream.flush().await?;
@@ -311,7 +259,7 @@ impl IpcServer {
         let mut state = ConnectionState::Connected;
 
         loop {
-            let request: IpcRequest = match read_message(&mut stream).await {
+            let request = match read_request(&mut stream).await {
                 Ok(req) => req,
                 Err(e) => {
                     let is_eof = matches!(
@@ -320,10 +268,6 @@ impl IpcServer {
                     );
 
                     if is_eof {
-                        // Crash protection: if we were in Ready state,
-                        // the plugin died without sending ModelUnloaded.
-                        // Unadvertise immediately so stale peers don't
-                        // try to RDMA from a dead process.
                         if let ConnectionState::Ready { ref agent_name } = state {
                             warn!(
                                 agent_name,
@@ -341,12 +285,12 @@ impl IpcServer {
                 }
             };
 
-            debug!(state = state.name(), ?request, "IPC request received");
+            debug!(state = state.name(), "IPC request received");
 
             let (response, next_state) = self.dispatch(request, state).await;
             state = next_state;
 
-            write_message(&mut stream, &response).await?;
+            write_response(&mut stream, &response).await?;
         }
         Ok(())
     }
@@ -356,94 +300,112 @@ impl IpcServer {
     /// leave the state unchanged.
     async fn dispatch(
         &self,
-        request: IpcRequest,
+        request: proto::IpcRequest,
         state: ConnectionState,
-    ) -> (IpcResponse, ConnectionState) {
-        match (request, state) {
+    ) -> (proto::IpcResponse, ConnectionState) {
+        let msg = match request.msg {
+            Some(m) => m,
+            None => {
+                return (
+                    proto::IpcResponse {
+                        msg: Some(proto::ipc_response::Msg::Error(proto::Error {
+                            message: "IPC request missing oneof msg".into(),
+                        })),
+                    },
+                    state,
+                );
+            }
+        };
+
+        match (msg, state) {
             // ── Connected + PrepareModel → Preparing ──────────────────
-            (
-                IpcRequest::PrepareModel {
-                    model_id,
-                    revision,
-                    tp_rank,
-                },
-                ConnectionState::Connected,
-            ) => self.handle_prepare_model(model_id, revision, tp_rank).await,
+            (proto::ipc_request::Msg::PrepareModel(pm), ConnectionState::Connected) => {
+                self.handle_prepare_model(pm.model_id, pm.revision, pm.tp_rank)
+                    .await
+            }
 
             // ── Ready + PrepareModel → hot-swap (unadvertise old, prepare new)
-            (
-                IpcRequest::PrepareModel {
-                    model_id,
-                    revision,
-                    tp_rank,
-                },
-                ConnectionState::Ready { agent_name },
-            ) => {
+            (proto::ipc_request::Msg::PrepareModel(pm), ConnectionState::Ready { agent_name }) => {
                 info!(agent_name, "hot-swap: unadvertising previous model");
                 self.cleanup_agent(&agent_name).await;
-                self.handle_prepare_model(model_id, revision, tp_rank).await
+                self.handle_prepare_model(pm.model_id, pm.revision, pm.tp_rank)
+                    .await
             }
 
             // ── Preparing + ModelLoaded → Ready ──────────────────────
             (
-                IpcRequest::ModelLoaded {
-                    agent_name,
-                    metadata,
-                    model_id,
-                    files,
-                    tp_rank,
-                },
+                proto::ipc_request::Msg::ModelLoaded(ml),
                 ConnectionState::Preparing {
                     model_id: prepared_model,
                     tp_rank: prepared_rank,
                 },
             ) => {
-                // Sanity check: the model_id and tp_rank should match what
-                // was prepared. Not a hard error (the client knows best),
-                // but worth flagging.
-                if model_id != prepared_model || tp_rank != prepared_rank {
+                if ml.model_id != prepared_model || ml.tp_rank != prepared_rank {
                     warn!(
                         expected_model = prepared_model,
-                        actual_model = model_id,
+                        actual_model = ml.model_id,
                         expected_rank = prepared_rank,
-                        actual_rank = tp_rank,
+                        actual_rank = ml.tp_rank,
                         "ModelLoaded model/rank doesn't match PrepareModel"
                     );
                 }
 
-                self.handle_model_loaded(agent_name, metadata, model_id, files, tp_rank)
-                    .await
+                self.handle_model_loaded(
+                    ml.agent_name,
+                    ml.nixl_md,
+                    ml.tensors,
+                    ml.model_id,
+                    ml.files,
+                    ml.tp_rank,
+                )
+                .await
             }
 
             // ── Ready + ModelUnloaded → Connected ────────────────────
             (
-                IpcRequest::ModelUnloaded { agent_name },
+                proto::ipc_request::Msg::ModelUnloaded(mu),
                 ConnectionState::Ready {
                     agent_name: current_agent,
                 },
             ) => {
-                if agent_name != current_agent {
+                if mu.agent_name != current_agent {
                     warn!(
-                        requested = agent_name,
+                        requested = mu.agent_name,
                         current = current_agent,
                         "ModelUnloaded agent doesn't match current, cleaning up both"
                     );
                     self.cleanup_agent(&current_agent).await;
                 }
-                self.cleanup_agent(&agent_name).await;
-                info!(agent_name, "model unloaded, connection back to Connected");
-                (IpcResponse::Ok, ConnectionState::Connected)
+                self.cleanup_agent(&mu.agent_name).await;
+                info!(
+                    agent_name = mu.agent_name,
+                    "model unloaded, connection back to Connected"
+                );
+                (
+                    proto::IpcResponse {
+                        msg: Some(proto::ipc_response::Msg::Ok(proto::Ok {})),
+                    },
+                    ConnectionState::Connected,
+                )
             }
 
             // ── Invalid transitions ──────────────────────────────────
-            (request, state) => {
-                let msg = format!(
-                    "invalid message {:?} in state {}",
-                    std::mem::discriminant(&request),
-                    state.name(),
-                );
-                warn!(msg, "IPC state machine violation");
-                (IpcResponse::Error { message: msg }, state)
+            (msg, state) => {
+                let variant = match &msg {
+                    proto::ipc_request::Msg::PrepareModel(_) => "PrepareModel",
+                    proto::ipc_request::Msg::ModelLoaded(_) => "ModelLoaded",
+                    proto::ipc_request::Msg::ModelUnloaded(_) => "ModelUnloaded",
+                };
+                let msg_text = format!("invalid message {} in state {}", variant, state.name(),);
+                warn!(msg_text, "IPC state machine violation");
+                (
+                    proto::IpcResponse {
+                        msg: Some(proto::ipc_response::Msg::Error(proto::Error {
+                            message: msg_text,
+                        })),
+                    },
+                    state,
+                )
             }
         }
     }
@@ -453,7 +415,7 @@ impl IpcServer {
         model_id: String,
         revision: String,
         tp_rank: u32,
-    ) -> (IpcResponse, ConnectionState) {
+    ) -> (proto::IpcResponse, ConnectionState) {
         info!(model_id, revision, tp_rank, "PrepareModel: starting");
 
         // Step 1: Get file list (from cache or HF API).
@@ -461,8 +423,10 @@ impl IpcServer {
             Ok(f) => f,
             Err(e) => {
                 return (
-                    IpcResponse::Error {
-                        message: format!("failed to list model files: {e}"),
+                    proto::IpcResponse {
+                        msg: Some(proto::ipc_response::Msg::Error(proto::Error {
+                            message: format!("failed to list model files: {e}"),
+                        })),
                     },
                     ConnectionState::Connected,
                 );
@@ -483,20 +447,39 @@ impl IpcServer {
 
         let next_state = ConnectionState::Preparing { model_id, tp_rank };
 
-        (IpcResponse::Prepared { files, peers }, next_state)
+        (
+            proto::IpcResponse {
+                msg: Some(proto::ipc_response::Msg::Prepared(proto::Prepared {
+                    files,
+                    peers,
+                    weight_map: HashMap::new(),
+                    transfer_plan: Vec::new(),
+                })),
+            },
+            next_state,
+        )
     }
 
     async fn handle_model_loaded(
         &self,
         agent_name: String,
-        metadata: Vec<u8>,
+        nixl_md: Vec<u8>,
+        tensors: Vec<proto::TensorInfo>,
         model_id: String,
         files: Vec<String>,
         tp_rank: u32,
-    ) -> (IpcResponse, ConnectionState) {
-        // Store raw NIXL metadata locally (served to peers via HTTP)
+    ) -> (proto::IpcResponse, ConnectionState) {
+        // Build the PeerNixlMd proto and serialize it for storage.
+        // Peers fetch this via HTTP and decode it as PeerNixlMd.
+        let peer_md = proto::PeerNixlMd {
+            agent_name: agent_name.clone(),
+            nixl_md,
+            tensors,
+        };
+        let stored_bytes = peer_md.encode_to_vec();
+
         self.model_peer_store
-            .insert(&agent_name, metadata.to_vec())
+            .insert(&agent_name, stored_bytes)
             .await;
 
         // Advertise lightweight pointer via discovery CRD
@@ -508,7 +491,6 @@ impl IpcServer {
             agent_name,
             model_id,
             tp_rank,
-            metadata_len = metadata.len(),
             file_count = files.len(),
             "ModelLoaded: metadata stored, CRD advertised"
         );
@@ -516,7 +498,12 @@ impl IpcServer {
         let next_state = ConnectionState::Ready {
             agent_name: agent_name.clone(),
         };
-        (IpcResponse::Ok, next_state)
+        (
+            proto::IpcResponse {
+                msg: Some(proto::ipc_response::Msg::Ok(proto::Ok {})),
+            },
+            next_state,
+        )
     }
 
     /// Remove all traces of an agent: unadvertise from CRD, remove from store.
@@ -587,7 +574,11 @@ impl IpcServer {
     /// non-zero, polls every 5s until peers appear or the timeout expires. This
     /// covers the window where a seed's CRD advertisement hasn't propagated through
     /// the K8s reflector yet.
-    async fn discover_and_fetch_peers(&self, model_id: &str, tp_rank: u32) -> Vec<PeerNixlMdInfo> {
+    async fn discover_and_fetch_peers(
+        &self,
+        model_id: &str,
+        tp_rank: u32,
+    ) -> Vec<proto::PeerNixlMd> {
         let start = tokio::time::Instant::now();
         let peers = loop {
             let found = self.discovery.find_model_peers(model_id, tp_rank).await;
@@ -630,10 +621,13 @@ impl IpcServer {
                     // loaded by THIS pod, not other pods on the same node).
                     if let Some(metadata) = store.get(&agent_name).await {
                         debug!(agent = %agent_name, len = metadata.len(), "local NIXL metadata (own store)");
-                        return Some(PeerNixlMdInfo {
-                            agent_name,
-                            metadata: metadata.to_vec(),
-                        });
+                        // Stored bytes are a serialized PeerNixlMd proto
+                        match proto::PeerNixlMd::decode(metadata.as_ref()) {
+                            Ok(peer_md) => return Some(peer_md),
+                            Err(e) => {
+                                warn!(agent = %agent_name, error = %e, "failed to decode local PeerNixlMd");
+                            }
+                        }
                     }
 
                     // Fetch via HTTP (works for both same-node and cross-node peers)
@@ -647,10 +641,13 @@ impl IpcServer {
                         Ok(resp) if resp.status().is_success() => match resp.bytes().await {
                             Ok(bytes) => {
                                 info!(agent = %agent_name, len = bytes.len(), "fetched peer NIXL metadata");
-                                Some(PeerNixlMdInfo {
-                                    agent_name,
-                                    metadata: bytes.to_vec(),
-                                })
+                                match proto::PeerNixlMd::decode(bytes.as_ref()) {
+                                    Ok(peer_md) => Some(peer_md),
+                                    Err(e) => {
+                                        warn!(agent = %agent_name, error = %e, "failed to decode remote PeerNixlMd");
+                                        None
+                                    }
+                                }
                             }
                             Err(e) => {
                                 warn!(agent = %agent_name, error = %e, "failed to read peer metadata body");
@@ -677,15 +674,15 @@ impl IpcServer {
 
 #[cfg(test)]
 mod tests {
-    use crate::ipc::{
-        FileListCache, IpcRequest, IpcResponse, IpcServer, PeerNixlMdInfo, read_message,
-        write_message,
-    };
+    use crate::ipc::{FileListCache, IpcServer};
     use crate::nixl_vram_store::ModelPeerStore;
+    use crate::proto;
+    use prost::Message;
     use std::sync::Arc;
     use std::time::Duration;
 
     use discovery::{MockDiscovery, PeerDiscovery};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixStream;
 
     async fn test_server(dir: &std::path::Path) -> Arc<IpcServer> {
@@ -704,27 +701,41 @@ mod tests {
         ))
     }
 
+    /// Write a protobuf IpcRequest over the stream (length-prefixed).
+    async fn send_request(stream: &mut UnixStream, req: &proto::IpcRequest) {
+        let data = req.encode_to_vec();
+        stream.write_u32(data.len() as u32).await.unwrap();
+        stream.write_all(&data).await.unwrap();
+        stream.flush().await.unwrap();
+    }
+
+    /// Read a protobuf IpcResponse from the stream (length-prefixed).
+    async fn recv_response(stream: &mut UnixStream) -> proto::IpcResponse {
+        let len = stream.read_u32().await.unwrap();
+        let mut buf = vec![0u8; len as usize];
+        stream.read_exact(&mut buf).await.unwrap();
+        proto::IpcResponse::decode(buf.as_slice()).unwrap()
+    }
+
     // Serialization round-trips
 
     #[test]
     fn request_roundtrip_prepare_model() {
-        let req = IpcRequest::PrepareModel {
-            model_id: "meta-llama/70b".into(),
-            revision: "main".into(),
-            tp_rank: 0,
+        let req = proto::IpcRequest {
+            msg: Some(proto::ipc_request::Msg::PrepareModel(proto::PrepareModel {
+                model_id: "meta-llama/70b".into(),
+                revision: "main".into(),
+                tp_rank: 0,
+            })),
         };
-        let bytes = rmp_serde::to_vec_named(&req).unwrap();
-        let decoded: IpcRequest = rmp_serde::from_slice(&bytes).unwrap();
+        let bytes = req.encode_to_vec();
+        let decoded = proto::IpcRequest::decode(bytes.as_slice()).unwrap();
 
-        match decoded {
-            IpcRequest::PrepareModel {
-                model_id,
-                revision,
-                tp_rank,
-            } => {
-                assert_eq!(model_id, "meta-llama/70b");
-                assert_eq!(revision, "main");
-                assert_eq!(tp_rank, 0);
+        match decoded.msg.unwrap() {
+            proto::ipc_request::Msg::PrepareModel(pm) => {
+                assert_eq!(pm.model_id, "meta-llama/70b");
+                assert_eq!(pm.revision, "main");
+                assert_eq!(pm.tp_rank, 0);
             }
             other => panic!("unexpected variant: {other:?}"),
         }
@@ -732,26 +743,33 @@ mod tests {
 
     #[test]
     fn request_roundtrip_model_loaded() {
-        let req = IpcRequest::ModelLoaded {
-            agent_name: "worker-0".into(),
-            metadata: vec![0xCA, 0xFE],
-            model_id: "m".into(),
-            files: vec!["f.safetensors".into()],
-            tp_rank: 1,
+        let req = proto::IpcRequest {
+            msg: Some(proto::ipc_request::Msg::ModelLoaded(proto::ModelLoaded {
+                agent_name: "worker-0".into(),
+                nixl_md: vec![0xCA, 0xFE],
+                tensors: vec![proto::TensorInfo {
+                    name: "layer.0.weight".into(),
+                    addr: 0x7F0000,
+                    size: 4096,
+                    device_id: 0,
+                    dtype: "torch.bfloat16".into(),
+                    checksum: 0,
+                }],
+                model_id: "m".into(),
+                files: vec!["f.safetensors".into()],
+                tp_rank: 1,
+            })),
         };
-        let bytes = rmp_serde::to_vec_named(&req).unwrap();
-        let decoded: IpcRequest = rmp_serde::from_slice(&bytes).unwrap();
+        let bytes = req.encode_to_vec();
+        let decoded = proto::IpcRequest::decode(bytes.as_slice()).unwrap();
 
-        match decoded {
-            IpcRequest::ModelLoaded {
-                agent_name,
-                metadata,
-                tp_rank,
-                ..
-            } => {
-                assert_eq!(agent_name, "worker-0");
-                assert_eq!(metadata, vec![0xCA, 0xFE]);
-                assert_eq!(tp_rank, 1);
+        match decoded.msg.unwrap() {
+            proto::ipc_request::Msg::ModelLoaded(ml) => {
+                assert_eq!(ml.agent_name, "worker-0");
+                assert_eq!(ml.nixl_md, vec![0xCA, 0xFE]);
+                assert_eq!(ml.tp_rank, 1);
+                assert_eq!(ml.tensors.len(), 1);
+                assert_eq!(ml.tensors[0].name, "layer.0.weight");
             }
             other => panic!("unexpected variant: {other:?}"),
         }
@@ -759,15 +777,19 @@ mod tests {
 
     #[test]
     fn request_roundtrip_model_unloaded() {
-        let req = IpcRequest::ModelUnloaded {
-            agent_name: "worker-0".into(),
+        let req = proto::IpcRequest {
+            msg: Some(proto::ipc_request::Msg::ModelUnloaded(
+                proto::ModelUnloaded {
+                    agent_name: "worker-0".into(),
+                },
+            )),
         };
-        let bytes = rmp_serde::to_vec_named(&req).unwrap();
-        let decoded: IpcRequest = rmp_serde::from_slice(&bytes).unwrap();
+        let bytes = req.encode_to_vec();
+        let decoded = proto::IpcRequest::decode(bytes.as_slice()).unwrap();
 
-        match decoded {
-            IpcRequest::ModelUnloaded { agent_name } => {
-                assert_eq!(agent_name, "worker-0");
+        match decoded.msg.unwrap() {
+            proto::ipc_request::Msg::ModelUnloaded(mu) => {
+                assert_eq!(mu.agent_name, "worker-0");
             }
             other => panic!("unexpected variant: {other:?}"),
         }
@@ -775,22 +797,27 @@ mod tests {
 
     #[test]
     fn response_roundtrip_prepared() {
-        let resp = IpcResponse::Prepared {
-            files: vec!["shard-001.safetensors".into()],
-            peers: vec![PeerNixlMdInfo {
-                agent_name: "peer-0".into(),
-                metadata: vec![0xDE, 0xAD],
-            }],
+        let resp = proto::IpcResponse {
+            msg: Some(proto::ipc_response::Msg::Prepared(proto::Prepared {
+                files: vec!["shard-001.safetensors".into()],
+                peers: vec![proto::PeerNixlMd {
+                    agent_name: "peer-0".into(),
+                    nixl_md: vec![0xDE, 0xAD],
+                    tensors: vec![],
+                }],
+                weight_map: std::collections::HashMap::new(),
+                transfer_plan: vec![],
+            })),
         };
-        let bytes = rmp_serde::to_vec_named(&resp).unwrap();
-        let decoded: IpcResponse = rmp_serde::from_slice(&bytes).unwrap();
+        let bytes = resp.encode_to_vec();
+        let decoded = proto::IpcResponse::decode(bytes.as_slice()).unwrap();
 
-        match decoded {
-            IpcResponse::Prepared { files, peers } => {
-                assert_eq!(files, vec!["shard-001.safetensors"]);
-                assert_eq!(peers.len(), 1);
-                assert_eq!(peers[0].agent_name, "peer-0");
-                assert_eq!(peers[0].metadata, vec![0xDE, 0xAD]);
+        match decoded.msg.unwrap() {
+            proto::ipc_response::Msg::Prepared(p) => {
+                assert_eq!(p.files, vec!["shard-001.safetensors"]);
+                assert_eq!(p.peers.len(), 1);
+                assert_eq!(p.peers[0].agent_name, "peer-0");
+                assert_eq!(p.peers[0].nixl_md, vec![0xDE, 0xAD]);
             }
             other => panic!("unexpected variant: {other:?}"),
         }
@@ -798,46 +825,63 @@ mod tests {
 
     #[test]
     fn all_request_variants_roundtrip() {
-        let requests: Vec<IpcRequest> = vec![
-            IpcRequest::PrepareModel {
-                model_id: "m".into(),
-                revision: "main".into(),
-                tp_rank: 0,
+        let requests = vec![
+            proto::IpcRequest {
+                msg: Some(proto::ipc_request::Msg::PrepareModel(proto::PrepareModel {
+                    model_id: "m".into(),
+                    revision: "main".into(),
+                    tp_rank: 0,
+                })),
             },
-            IpcRequest::ModelLoaded {
-                agent_name: "a".into(),
-                metadata: vec![1],
-                model_id: "m".into(),
-                files: vec!["f".into()],
-                tp_rank: 0,
+            proto::IpcRequest {
+                msg: Some(proto::ipc_request::Msg::ModelLoaded(proto::ModelLoaded {
+                    agent_name: "a".into(),
+                    nixl_md: vec![1],
+                    tensors: vec![],
+                    model_id: "m".into(),
+                    files: vec!["f".into()],
+                    tp_rank: 0,
+                })),
             },
-            IpcRequest::ModelUnloaded {
-                agent_name: "a".into(),
+            proto::IpcRequest {
+                msg: Some(proto::ipc_request::Msg::ModelUnloaded(
+                    proto::ModelUnloaded {
+                        agent_name: "a".into(),
+                    },
+                )),
             },
         ];
 
         for req in &requests {
-            let bytes = rmp_serde::to_vec_named(req).unwrap();
-            let _decoded: IpcRequest = rmp_serde::from_slice(&bytes).unwrap();
+            let bytes = req.encode_to_vec();
+            let _decoded = proto::IpcRequest::decode(bytes.as_slice()).unwrap();
         }
     }
 
     #[test]
     fn all_response_variants_roundtrip() {
-        let responses: Vec<IpcResponse> = vec![
-            IpcResponse::Prepared {
-                files: vec![],
-                peers: vec![],
+        let responses = vec![
+            proto::IpcResponse {
+                msg: Some(proto::ipc_response::Msg::Prepared(proto::Prepared {
+                    files: vec![],
+                    peers: vec![],
+                    weight_map: std::collections::HashMap::new(),
+                    transfer_plan: vec![],
+                })),
             },
-            IpcResponse::Ok,
-            IpcResponse::Error {
-                message: "boom".into(),
+            proto::IpcResponse {
+                msg: Some(proto::ipc_response::Msg::Ok(proto::Ok {})),
+            },
+            proto::IpcResponse {
+                msg: Some(proto::ipc_response::Msg::Error(proto::Error {
+                    message: "boom".into(),
+                })),
             },
         ];
 
         for resp in &responses {
-            let bytes = rmp_serde::to_vec_named(resp).unwrap();
-            let _decoded: IpcResponse = rmp_serde::from_slice(&bytes).unwrap();
+            let bytes = resp.encode_to_vec();
+            let _decoded = proto::IpcResponse::decode(bytes.as_slice()).unwrap();
         }
     }
 
@@ -860,13 +904,50 @@ mod tests {
 
     // State machine integration tests (real Unix sockets)
 
+    fn make_prepare_model(model_id: &str, revision: &str, tp_rank: u32) -> proto::IpcRequest {
+        proto::IpcRequest {
+            msg: Some(proto::ipc_request::Msg::PrepareModel(proto::PrepareModel {
+                model_id: model_id.into(),
+                revision: revision.into(),
+                tp_rank,
+            })),
+        }
+    }
+
+    fn make_model_loaded(
+        agent_name: &str,
+        nixl_md: Vec<u8>,
+        model_id: &str,
+        files: Vec<String>,
+        tp_rank: u32,
+    ) -> proto::IpcRequest {
+        proto::IpcRequest {
+            msg: Some(proto::ipc_request::Msg::ModelLoaded(proto::ModelLoaded {
+                agent_name: agent_name.into(),
+                nixl_md,
+                tensors: vec![],
+                model_id: model_id.into(),
+                files,
+                tp_rank,
+            })),
+        }
+    }
+
+    fn make_model_unloaded(agent_name: &str) -> proto::IpcRequest {
+        proto::IpcRequest {
+            msg: Some(proto::ipc_request::Msg::ModelUnloaded(
+                proto::ModelUnloaded {
+                    agent_name: agent_name.into(),
+                },
+            )),
+        }
+    }
+
     #[tokio::test]
     async fn state_machine_happy_path() {
-        // Connected → PrepareModel → Preparing → ModelLoaded → Ready → ModelUnloaded → Connected
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(tmp.path()).await;
 
-        // Pre-populate file cache so PrepareModel doesn't hit HF API
         server
             .file_cache()
             .insert("test/model", "main", vec!["shard-001.safetensors".into()])
@@ -876,67 +957,64 @@ mod tests {
         let mut stream = UnixStream::connect(server.socket_path()).await.unwrap();
 
         // PrepareModel
-        let req = IpcRequest::PrepareModel {
-            model_id: "test/model".into(),
-            revision: "main".into(),
-            tp_rank: 0,
-        };
-        write_message(&mut stream, &req).await.unwrap();
-        let resp: IpcResponse = read_message(&mut stream).await.unwrap();
-        match resp {
-            IpcResponse::Prepared { files, peers } => {
-                assert_eq!(files, vec!["shard-001.safetensors"]);
-                assert!(peers.is_empty()); // no peers in mock
+        send_request(&mut stream, &make_prepare_model("test/model", "main", 0)).await;
+        let resp = recv_response(&mut stream).await;
+        match resp.msg.unwrap() {
+            proto::ipc_response::Msg::Prepared(p) => {
+                assert_eq!(p.files, vec!["shard-001.safetensors"]);
+                assert!(p.peers.is_empty());
             }
             other => panic!("expected Prepared, got {other:?}"),
         }
 
         // ModelLoaded
-        let req = IpcRequest::ModelLoaded {
-            agent_name: "worker-0".into(),
-            metadata: vec![0xCA, 0xFE],
-            model_id: "test/model".into(),
-            files: vec!["shard-001.safetensors".into()],
-            tp_rank: 0,
-        };
-        write_message(&mut stream, &req).await.unwrap();
-        let resp: IpcResponse = read_message(&mut stream).await.unwrap();
-        assert!(matches!(resp, IpcResponse::Ok));
+        send_request(
+            &mut stream,
+            &make_model_loaded(
+                "worker-0",
+                vec![0xCA, 0xFE],
+                "test/model",
+                vec!["shard-001.safetensors".into()],
+                0,
+            ),
+        )
+        .await;
+        let resp = recv_response(&mut stream).await;
+        assert!(matches!(resp.msg.unwrap(), proto::ipc_response::Msg::Ok(_)));
 
         // ModelUnloaded
-        let req = IpcRequest::ModelUnloaded {
-            agent_name: "worker-0".into(),
-        };
-        write_message(&mut stream, &req).await.unwrap();
-        let resp: IpcResponse = read_message(&mut stream).await.unwrap();
-        assert!(matches!(resp, IpcResponse::Ok));
+        send_request(&mut stream, &make_model_unloaded("worker-0")).await;
+        let resp = recv_response(&mut stream).await;
+        assert!(matches!(resp.msg.unwrap(), proto::ipc_response::Msg::Ok(_)));
 
         handle.abort();
     }
 
     #[tokio::test]
     async fn state_machine_invalid_transition_returns_error() {
-        // Connected + ModelLoaded should fail (need PrepareModel first)
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(tmp.path()).await;
 
         let handle = Arc::clone(&server).start().unwrap();
         let mut stream = UnixStream::connect(server.socket_path()).await.unwrap();
 
-        let req = IpcRequest::ModelLoaded {
-            agent_name: "worker-0".into(),
-            metadata: vec![0xDE, 0xAD],
-            model_id: "test/model".into(),
-            files: vec!["f.safetensors".into()],
-            tp_rank: 0,
-        };
-        write_message(&mut stream, &req).await.unwrap();
-        let resp: IpcResponse = read_message(&mut stream).await.unwrap();
-
-        match resp {
-            IpcResponse::Error { message } => {
-                assert!(message.contains("invalid message"));
-                assert!(message.contains("Connected"));
+        // Connected + ModelLoaded should fail
+        send_request(
+            &mut stream,
+            &make_model_loaded(
+                "worker-0",
+                vec![0xDE, 0xAD],
+                "test/model",
+                vec!["f.safetensors".into()],
+                0,
+            ),
+        )
+        .await;
+        let resp = recv_response(&mut stream).await;
+        match resp.msg.unwrap() {
+            proto::ipc_response::Msg::Error(e) => {
+                assert!(e.message.contains("invalid message"));
+                assert!(e.message.contains("Connected"));
             }
             other => panic!("expected Error, got {other:?}"),
         }
@@ -946,27 +1024,24 @@ mod tests {
 
     #[tokio::test]
     async fn state_machine_model_unloaded_in_wrong_state() {
-        // Connected + ModelUnloaded should fail
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(tmp.path()).await;
 
         let handle = Arc::clone(&server).start().unwrap();
         let mut stream = UnixStream::connect(server.socket_path()).await.unwrap();
 
-        let req = IpcRequest::ModelUnloaded {
-            agent_name: "ghost".into(),
-        };
-        write_message(&mut stream, &req).await.unwrap();
-        let resp: IpcResponse = read_message(&mut stream).await.unwrap();
-        assert!(matches!(resp, IpcResponse::Error { .. }));
+        send_request(&mut stream, &make_model_unloaded("ghost")).await;
+        let resp = recv_response(&mut stream).await;
+        assert!(matches!(
+            resp.msg.unwrap(),
+            proto::ipc_response::Msg::Error(_)
+        ));
 
         handle.abort();
     }
 
     #[tokio::test]
     async fn eof_in_ready_state_auto_unadvertises() {
-        // If the plugin crashes (EOF) while in Ready, the sidecar should
-        // auto-unadvertise to prevent stale RDMA targets.
         let tmp = tempfile::tempdir().unwrap();
         let discovery = Arc::new(MockDiscovery::new("test-node"));
         let nixl_store = ModelPeerStore::new();
@@ -992,24 +1067,22 @@ mod tests {
             let mut stream = UnixStream::connect(&socket_path).await.unwrap();
 
             // PrepareModel
-            let req = IpcRequest::PrepareModel {
-                model_id: "test/model".into(),
-                revision: "main".into(),
-                tp_rank: 0,
-            };
-            write_message(&mut stream, &req).await.unwrap();
-            let _: IpcResponse = read_message(&mut stream).await.unwrap();
+            send_request(&mut stream, &make_prepare_model("test/model", "main", 0)).await;
+            let _ = recv_response(&mut stream).await;
 
             // ModelLoaded
-            let req = IpcRequest::ModelLoaded {
-                agent_name: "crash-test".into(),
-                metadata: vec![0xFF],
-                model_id: "test/model".into(),
-                files: vec!["shard.safetensors".into()],
-                tp_rank: 0,
-            };
-            write_message(&mut stream, &req).await.unwrap();
-            let _: IpcResponse = read_message(&mut stream).await.unwrap();
+            send_request(
+                &mut stream,
+                &make_model_loaded(
+                    "crash-test",
+                    vec![0xFF],
+                    "test/model",
+                    vec!["shard.safetensors".into()],
+                    0,
+                ),
+            )
+            .await;
+            let _ = recv_response(&mut stream).await;
 
             // Verify metadata is stored
             assert!(nixl_store.get("crash-test").await.is_some());
@@ -1063,35 +1136,28 @@ mod tests {
         let mut stream = UnixStream::connect(&socket_path).await.unwrap();
 
         // Load model A
-        let req = IpcRequest::PrepareModel {
-            model_id: "model-a".into(),
-            revision: "main".into(),
-            tp_rank: 0,
-        };
-        write_message(&mut stream, &req).await.unwrap();
-        let _: IpcResponse = read_message(&mut stream).await.unwrap();
+        send_request(&mut stream, &make_prepare_model("model-a", "main", 0)).await;
+        let _ = recv_response(&mut stream).await;
 
-        let req = IpcRequest::ModelLoaded {
-            agent_name: "agent-a".into(),
-            metadata: vec![0xAA],
-            model_id: "model-a".into(),
-            files: vec!["a.safetensors".into()],
-            tp_rank: 0,
-        };
-        write_message(&mut stream, &req).await.unwrap();
-        let _: IpcResponse = read_message(&mut stream).await.unwrap();
+        send_request(
+            &mut stream,
+            &make_model_loaded(
+                "agent-a",
+                vec![0xAA],
+                "model-a",
+                vec!["a.safetensors".into()],
+                0,
+            ),
+        )
+        .await;
+        let _ = recv_response(&mut stream).await;
 
         // Verify model A is advertised
         assert!(nixl_store.get("agent-a").await.is_some());
 
         // Hot-swap: PrepareModel for model B while in Ready
-        let req = IpcRequest::PrepareModel {
-            model_id: "model-b".into(),
-            revision: "main".into(),
-            tp_rank: 0,
-        };
-        write_message(&mut stream, &req).await.unwrap();
-        let _: IpcResponse = read_message(&mut stream).await.unwrap();
+        send_request(&mut stream, &make_prepare_model("model-b", "main", 0)).await;
+        let _ = recv_response(&mut stream).await;
 
         // Model A should be cleaned up
         assert!(
@@ -1122,19 +1188,14 @@ mod tests {
         let handle = Arc::clone(&server).start().unwrap();
         let mut stream = UnixStream::connect(server.socket_path()).await.unwrap();
 
-        let req = IpcRequest::PrepareModel {
-            model_id: "org/model".into(),
-            revision: "v1".into(),
-            tp_rank: 0,
-        };
-        write_message(&mut stream, &req).await.unwrap();
-        let resp: IpcResponse = read_message(&mut stream).await.unwrap();
+        send_request(&mut stream, &make_prepare_model("org/model", "v1", 0)).await;
+        let resp = recv_response(&mut stream).await;
 
-        match resp {
-            IpcResponse::Prepared { files, .. } => {
-                assert_eq!(files.len(), 2);
-                assert!(files.contains(&"shard-001.safetensors".to_string()));
-                assert!(files.contains(&"shard-002.safetensors".to_string()));
+        match resp.msg.unwrap() {
+            proto::ipc_response::Msg::Prepared(p) => {
+                assert_eq!(p.files.len(), 2);
+                assert!(p.files.contains(&"shard-001.safetensors".to_string()));
+                assert!(p.files.contains(&"shard-002.safetensors".to_string()));
             }
             other => panic!("expected Prepared, got {other:?}"),
         }
@@ -1144,36 +1205,30 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_model_hf_unreachable_returns_error() {
-        // No file cache, HF API unreachable → error response, stays Connected
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(tmp.path()).await;
 
         let handle = Arc::clone(&server).start().unwrap();
         let mut stream = UnixStream::connect(server.socket_path()).await.unwrap();
 
-        let req = IpcRequest::PrepareModel {
-            model_id: "org/model".into(),
-            revision: "main".into(),
-            tp_rank: 0,
-        };
-        write_message(&mut stream, &req).await.unwrap();
-        let resp: IpcResponse = read_message(&mut stream).await.unwrap();
-        assert!(matches!(resp, IpcResponse::Error { .. }));
+        send_request(&mut stream, &make_prepare_model("org/model", "main", 0)).await;
+        let resp = recv_response(&mut stream).await;
+        assert!(matches!(
+            resp.msg.unwrap(),
+            proto::ipc_response::Msg::Error(_)
+        ));
 
         // Should still be in Connected state, so PrepareModel again should work
-        // (once we have a cache hit)
         server
             .file_cache()
             .insert("org/model", "main", vec!["f.safetensors".into()])
             .await;
-        let req = IpcRequest::PrepareModel {
-            model_id: "org/model".into(),
-            revision: "main".into(),
-            tp_rank: 0,
-        };
-        write_message(&mut stream, &req).await.unwrap();
-        let resp: IpcResponse = read_message(&mut stream).await.unwrap();
-        assert!(matches!(resp, IpcResponse::Prepared { .. }));
+        send_request(&mut stream, &make_prepare_model("org/model", "main", 0)).await;
+        let resp = recv_response(&mut stream).await;
+        assert!(matches!(
+            resp.msg.unwrap(),
+            proto::ipc_response::Msg::Prepared(_)
+        ));
 
         handle.abort();
     }
@@ -1187,13 +1242,14 @@ mod tests {
 
         let mut stream = UnixStream::connect(server.socket_path()).await.unwrap();
 
-        use tokio::io::AsyncWriteExt;
         let fake_len: u32 = 128 * 1024 * 1024;
         stream.write_u32(fake_len).await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let result: Result<IpcResponse, _> = read_message(&mut stream).await;
+        // The server should have dropped the connection
+        let mut buf = [0u8; 4];
+        let result = stream.read_exact(&mut buf).await;
         assert!(
             result.is_err(),
             "oversized message should cause connection drop"

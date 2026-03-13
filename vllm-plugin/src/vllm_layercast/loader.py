@@ -17,8 +17,6 @@ import time
 import urllib.request
 from typing import TYPE_CHECKING
 
-import msgpack
-
 from vllm_layercast.log import get_logger
 
 log = get_logger("vllm_layercast.loader")
@@ -49,7 +47,7 @@ from vllm_layercast.backend_rust import RustSidecarBackend  # noqa: E402
 from vllm_layercast.checksum import is_enabled as _checksum_enabled  # noqa: E402
 from vllm_layercast.checksum import verify_checksums  # noqa: E402
 from vllm_layercast.nixl_agent import VramNixlAgent, _COALESCE_THRESHOLD  # noqa: E402
-from vllm_layercast.proto import PeerNixlMd  # noqa: E402
+from vllm_layercast.proto import PeerNixlMd, Prepared, TensorInfo  # noqa: E402
 
 # Keep NIXL agents alive for the process lifetime so remote peers can
 # RDMA-read. Without this, the agent (and its registered memory)
@@ -99,7 +97,9 @@ class LayercastModelLoader(BaseModelLoader):
         revision = model_config.revision or "main"
 
         # Single batched call for file list + peers
-        weight_files, peers = self._prepare_model(repo_id, revision, tp_rank)
+        prepared = self._prepare_model(repo_id, revision, tp_rank)
+        weight_files = prepared.files if prepared else []
+        peers = prepared.peers if prepared else []
         if not weight_files:
             weight_files = self._get_weight_files(model_config)
         if not weight_files:
@@ -150,7 +150,9 @@ class LayercastModelLoader(BaseModelLoader):
 
         # Single batched call: file list + peer discovery + metadata fetch.
         # Falls back to local dir scan / HF API if backend is unavailable.
-        weight_files, peers = self._prepare_model(repo_id, revision, tp_rank)
+        prepared = self._prepare_model(repo_id, revision, tp_rank)
+        weight_files = prepared.files if prepared else []
+        peers = prepared.peers if prepared else []
         if not weight_files:
             weight_files = self._get_weight_files(model_config)
 
@@ -223,11 +225,12 @@ class LayercastModelLoader(BaseModelLoader):
         model.parameters() point at buffers filled by RDMA with no intermediate
         copies.
 
-        The compound metadata format (msgpack):
-          {"nixl_md": <bytes>, "tensors": [{"name", "addr", "size", "device_id"}, ...]}
+        Peer metadata is structured protobuf:
+          PeerNixlMd { nixl_md: bytes, tensors: [TensorInfo { name, addr, size, ... }] }
         """
         if peers is None:
-            _, peers = self._prepare_model(repo_id, revision, tp_rank)
+            prepared = self._prepare_model(repo_id, revision, tp_rank)
+            peers = prepared.peers if prepared else []
 
         if not peers:
             log.debug("nixl_no_peers", model=repo_id, rank=tp_rank)
@@ -235,7 +238,7 @@ class LayercastModelLoader(BaseModelLoader):
 
         peer = peers[0]
         log.info(
-            "nixl_peer_found", agent=peer.agent_name, metadata_bytes=len(peer.metadata)
+            "nixl_peer_found", agent=peer.agent_name, metadata_bytes=len(peer.nixl_md)
         )
 
         try:
@@ -244,13 +247,8 @@ class LayercastModelLoader(BaseModelLoader):
             log.warning("nixl_agent_init_failed", error=str(exc))
             return False
 
-        try:
-            compound = msgpack.unpackb(peer.metadata, raw=False)
-            nixl_md = compound["nixl_md"]
-            remote_manifest = {t["name"]: t for t in compound["tensors"]}
-        except (KeyError, TypeError, msgpack.UnpackException):
-            log.warning("nixl_bad_metadata")
-            return False
+        nixl_md = peer.nixl_md
+        remote_manifest: dict[str, TensorInfo] = {t.name: t for t in peer.tensors}
 
         if not remote_manifest:
             log.warning("nixl_empty_manifest")
@@ -271,7 +269,7 @@ class LayercastModelLoader(BaseModelLoader):
             if name not in remote_manifest:
                 continue
             remote_info = remote_manifest[name]
-            dtype = _parse_torch_dtype(remote_info.get("dtype"), param.dtype)
+            dtype = _parse_torch_dtype(remote_info.dtype or None, param.dtype)
             cuda_buf = torch.empty(param.shape, dtype=dtype, device=device)
             param.data = cuda_buf
             local_tensors[name] = cuda_buf
@@ -318,8 +316,8 @@ class LayercastModelLoader(BaseModelLoader):
             offset = 0
             for name, tensor in small_entries:
                 remote = remote_manifest[name]
-                nbytes = remote["size"]
-                remote_regions.append((remote["addr"], nbytes, remote["device_id"]))
+                nbytes = remote.size
+                remote_regions.append((remote.addr, nbytes, remote.device_id))
                 offsets.append(offset)
                 scatter_plan.append((name, offset, nbytes))
                 offset += nbytes
@@ -348,10 +346,10 @@ class LayercastModelLoader(BaseModelLoader):
             try:
                 handle = agent.read_from_peer(
                     local_tensor=local_tensor,
-                    remote_addr=remote["addr"],
-                    remote_len=remote["size"],
+                    remote_addr=remote.addr,
+                    remote_len=remote.size,
                     peer_name=peer_name,
-                    remote_device_id=remote["device_id"],
+                    remote_device_id=remote.device_id,
                 )
                 handles.append((name, handle))
             except Exception as exc:
@@ -366,14 +364,13 @@ class LayercastModelLoader(BaseModelLoader):
                 log.warning("nixl_transfer_failed", tensor=name, error=str(exc))
                 return False
 
-        # Build expected checksums from remote manifest (may be empty for
-        # old sources that don't publish checksums, in which case we skip).
+        # Build expected checksums from remote manifest (0 means unset in proto3).
         expected_checksums: dict[str, int] = {}
         if _checksum_enabled():
             expected_checksums = {
-                name: info["checksum"]
+                name: info.checksum
                 for name, info in remote_manifest.items()
-                if info.get("checksum") is not None
+                if info.checksum != 0
             }
 
         t_checksum = time.monotonic()
@@ -452,8 +449,9 @@ class LayercastModelLoader(BaseModelLoader):
     ) -> None:
         """Register loaded VRAM tensors with NIXL and publish metadata.
 
-        Packs both the NIXL agent metadata and the tensor address manifest
-        into a compound msgpack payload. The backend treats it as opaque bytes.
+        Sends the NIXL agent metadata and tensor address manifest as separate
+        protobuf fields to the daemon. The daemon stores them as a serialized
+        PeerNixlMd proto.
 
         If tensors are already registered (e.g. from _try_nixl_load), we
         skip re-registration to avoid the ~5s cost.
@@ -480,29 +478,33 @@ class LayercastModelLoader(BaseModelLoader):
             log.warning("nixl_register_vram_failed", error=str(exc))
             return
 
-        # Pack NIXL metadata + tensor address manifest into compound payload.
-        # Peers unpack this to get both the NIXL blob (for agent import) and
-        # the address map (for constructing remote transfer descriptors).
-        try:
-            compound = msgpack.packb(
-                {
-                    "nixl_md": agent.get_metadata(),
-                    "tensors": agent.get_weight_manifest(),
-                },
-                use_bin_type=True,
+        # Build TensorInfo protos from the agent's weight manifest.
+        # The manifest dict values are typed as int|str|None, so we cast
+        # to the proto field types here.
+        tensor_infos: list[TensorInfo] = []
+        for entry in agent.get_weight_manifest():
+            checksum_val = entry.get("checksum")
+            tensor_infos.append(
+                TensorInfo(
+                    name=str(entry["name"]),
+                    addr=int(entry["addr"]),  # type: ignore[arg-type]
+                    size=int(entry["size"]),  # type: ignore[arg-type]
+                    device_id=int(entry["device_id"]),  # type: ignore[arg-type]
+                    dtype=str(entry.get("dtype", "")),
+                    checksum=int(checksum_val) if checksum_val is not None else 0,
+                )
             )
-        except Exception as exc:
-            log.warning("nixl_metadata_pack_failed", error=str(exc))
-            return
 
-        log.info("publishing_nixl_metadata", bytes=len(compound))
+        nixl_md = agent.get_metadata()
+        log.info("publishing_nixl_metadata", bytes=len(nixl_md))
         loop = self._get_backend_loop()
         try:
             backend = loop.run_until_complete(self._get_backend())
             loop.run_until_complete(
                 backend.model_loaded(
                     agent_name=agent.name,
-                    metadata=compound,
+                    nixl_md=nixl_md,
+                    tensors=tensor_infos,
                     model_id=repo_id,
                     files=weight_files,
                     tp_rank=tp_rank,
@@ -539,28 +541,29 @@ class LayercastModelLoader(BaseModelLoader):
 
     def _prepare_model(
         self, repo_id: str, revision: str, tp_rank: int
-    ) -> tuple[list[str], list[PeerNixlMd]]:
+    ) -> Prepared | None:
         """Call backend.prepare_model() to get files + peers in one round-trip.
 
-        Falls back to local directory scan / HF API if the backend is unavailable.
+        Returns a Prepared proto with files, peers, weight_map, and transfer_plan.
+        Returns None if the backend is unavailable.
         """
         loop = self._get_backend_loop()
         try:
             backend = loop.run_until_complete(self._get_backend())
-            files, peers = loop.run_until_complete(
+            prepared = loop.run_until_complete(
                 backend.prepare_model(repo_id, revision, tp_rank)
             )
-            if files:
+            if prepared.files:
                 log.info(
                     "prepare_model_ok",
-                    files=len(files),
-                    peers=len(peers),
+                    files=len(prepared.files),
+                    peers=len(prepared.peers),
                     model=repo_id,
                 )
-            return files, peers
+            return prepared
         except Exception as exc:
             log.debug("prepare_model_failed", error=str(exc))
-        return [], []
+        return None
 
     def _get_weight_files(self, model_config: ModelConfig) -> list[str]:
         """Cached weight file discovery.

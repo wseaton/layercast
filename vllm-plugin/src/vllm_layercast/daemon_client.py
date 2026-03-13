@@ -8,14 +8,13 @@ from pathlib import Path
 
 from vllm_layercast.log import get_logger
 from vllm_layercast.proto import (
-    Error,
+    IpcRequest,
+    IpcResponse,
     ModelLoaded,
     ModelUnloaded,
-    Ok,
-    PeerNixlMd,
     Prepared,
     PrepareModel,
-    RequestMessage,
+    TensorInfo,
     decode_response,
     encode,
 )
@@ -28,7 +27,7 @@ DEFAULT_SOCKET_PATH = "/var/run/layercast/daemon.sock"
 class DaemonClient:
     """Talks to the layercast Rust daemon over a Unix domain socket.
 
-    Wire format: 4-byte big-endian length prefix + msgpack payload.
+    Wire format: 4-byte big-endian length prefix + protobuf payload.
     Speaks the state machine protocol (PrepareModel -> ModelLoaded -> ModelUnloaded).
     """
 
@@ -61,46 +60,53 @@ class DaemonClient:
         model_id: str,
         revision: str,
         tp_rank: int,
-    ) -> tuple[list[str], list[PeerNixlMd]]:
+    ) -> Prepared:
         """Ask daemon to list files + discover NIXL peers.
 
-        Returns (files, peers). The daemon does file listing and peer metadata
-        fetch in one batched operation.
+        Returns a Prepared message with files, peers, weight_map, and transfer_plan.
         """
-        msg = PrepareModel(model_id=model_id, revision=revision, tp_rank=tp_rank)
+        msg = IpcRequest(
+            prepare_model=PrepareModel(
+                model_id=model_id, revision=revision, tp_rank=tp_rank
+            )
+        )
         resp = await self._roundtrip(msg)
-        if isinstance(resp, Error):
-            raise RuntimeError(f"PrepareModel failed: {resp.message}")
-        if not isinstance(resp, Prepared):
-            raise TypeError(f"Expected Prepared, got {type(resp).__name__}")
-        return resp.files, resp.peers
+        if resp.is_set("error"):
+            raise RuntimeError(f"PrepareModel failed: {resp.error.message}")
+        if not resp.is_set("prepared"):
+            raise TypeError("Expected Prepared response")
+        return resp.prepared
 
     async def model_loaded(
         self,
         agent_name: str,
-        metadata: bytes,
+        nixl_md: bytes,
+        tensors: list[TensorInfo],
         model_id: str,
         files: list[str],
         tp_rank: int,
     ) -> None:
         """Tell daemon model is loaded: store NIXL metadata + advertise via CRD."""
-        msg = ModelLoaded(
-            agent_name=agent_name,
-            metadata=metadata,
-            model_id=model_id,
-            files=files,
-            tp_rank=tp_rank,
+        msg = IpcRequest(
+            model_loaded=ModelLoaded(
+                agent_name=agent_name,
+                nixl_md=nixl_md,
+                tensors=tensors,
+                model_id=model_id,
+                files=files,
+                tp_rank=tp_rank,
+            )
         )
         resp = await self._roundtrip(msg)
-        if isinstance(resp, Error):
-            raise RuntimeError(f"ModelLoaded failed: {resp.message}")
+        if resp.is_set("error"):
+            raise RuntimeError(f"ModelLoaded failed: {resp.error.message}")
 
     async def model_unloaded(self, agent_name: str) -> None:
         """Tell daemon to unadvertise + remove metadata."""
-        msg = ModelUnloaded(agent_name=agent_name)
+        msg = IpcRequest(model_unloaded=ModelUnloaded(agent_name=agent_name))
         resp = await self._roundtrip(msg)
-        if isinstance(resp, Error):
-            raise RuntimeError(f"ModelUnloaded failed: {resp.message}")
+        if resp.is_set("error"):
+            raise RuntimeError(f"ModelUnloaded failed: {resp.error.message}")
 
     # Internal helpers
 
@@ -114,12 +120,12 @@ class DaemonClient:
             raise RuntimeError("Not connected to daemon. Call connect() first.")
         return self._writer
 
-    async def _send(self, msg: RequestMessage) -> None:
+    async def _send(self, msg: IpcRequest) -> None:
         writer = self._ensure_writer()
         writer.write(encode(msg))
         await writer.drain()
 
-    async def _recv(self) -> Prepared | Ok | Error | dict[str, object]:
+    async def _recv(self) -> IpcResponse:
         reader = self._ensure_reader()
         length_bytes = await reader.readexactly(4)
         (length,) = struct.unpack(">I", length_bytes)
@@ -131,9 +137,7 @@ class DaemonClient:
         data = await reader.readexactly(length)
         return decode_response(data)
 
-    async def _roundtrip(
-        self, msg: RequestMessage
-    ) -> Prepared | Ok | Error | dict[str, object]:
+    async def _roundtrip(self, msg: IpcRequest) -> IpcResponse:
         """Send a request and receive the response, reconnecting once on socket errors."""
         try:
             await self._send(msg)
