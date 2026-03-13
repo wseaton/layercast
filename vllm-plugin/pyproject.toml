@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
 name = "vllm-layercast"
-version = "0.2.0"
+dynamic = ["version"]
 description = "Layercast P2P model loading plugin for vLLM"
 requires-python = ">=3.10"
 license = "MIT OR Apache-2.0"
@@ -22,6 +22,10 @@ dev = ["pytest", "pytest-asyncio", "ruff"]
 
 [project.entry-points."vllm.general_plugins"]
 layercast = "vllm_layercast.plugin:register"
+
+[tool.hatch.version]
+source = "vcs"
+raw-options = { root = ".." }
 
 [tool.ty.environment]
 python-version = "3.12"

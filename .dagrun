@@ -25,7 +25,7 @@ model-mesh-push: model-mesh-build
 # @ssh ${BUILD_HOST} workdir=${BUILD_WORKDIR}
 # @timeout 20m
 vllm-plugin-build: sync
-    export TMPDIR=${PODMAN_TMPDIR} && podman build -f Containerfile.vllm-plugin -t ${REGISTRY}:${VLLM_TAG} .
+    export TMPDIR=${PODMAN_TMPDIR} && podman build --build-arg PACKAGE_VERSION=0.0.0+git.$(git rev-parse --short HEAD) -f Containerfile.vllm-plugin -t ${REGISTRY}:${VLLM_TAG} .
 
 # Push vLLM plugin image to registry
 # @ssh ${BUILD_HOST}
