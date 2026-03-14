@@ -333,28 +333,33 @@ class LayercastModelLoader(BaseModelLoader):
             total_assignments=sum(len(a.assigned_tensors) for a in plan),
         )
 
-        # Build a unified remote manifest from the first peer (all peers
-        # have the same model, so tensor metadata is identical).
-        all_tensors = prepared.peers[0].tensors if prepared.peers else []
-        remote_manifest: dict[str, TensorInfo] = {t.name: t for t in all_tensors}
-        if not remote_manifest:
-            log.warning("nixl_empty_manifest")
-            return False
-
-        # Load metadata for all peers.
+        # Load metadata for all peers and build per-peer manifests.
+        # Each peer has different VRAM addresses for the same tensors,
+        # so we must use each peer's own tensor list, not a shared one.
         peer_names: dict[str, str] = {}
+        peer_manifests: dict[str, dict[str, TensorInfo]] = {}
         for assignment in plan:
             peer_names[assignment.agent_name] = agent.load_peer_metadata(
                 assignment.nixl_md
             )
+            peer_manifests[assignment.agent_name] = {
+                t.name: t for t in assignment.tensors
+            }
             log.info(
                 "nixl_peer_loaded",
                 peer=peer_names[assignment.agent_name],
                 assigned_tensors=len(assignment.assigned_tensors),
             )
 
+        # Use any peer's manifest for materialization (names/sizes are
+        # identical across peers, only addresses differ).
+        first_manifest = peer_manifests[plan[0].agent_name]
+        if not first_manifest:
+            log.warning("nixl_empty_manifest")
+            return False
+
         t_xfer = time.monotonic()
-        local_tensors = _materialize_params(model, remote_manifest)
+        local_tensors = _materialize_params(model, first_manifest)
         if not local_tensors:
             log.warning("nixl_no_matching_params")
             return False
@@ -362,7 +367,7 @@ class LayercastModelLoader(BaseModelLoader):
         log.info(
             "nixl_materialized",
             matched=len(local_tensors),
-            remote=len(remote_manifest),
+            remote=len(first_manifest),
             peers=len(plan),
         )
 
@@ -370,19 +375,20 @@ class LayercastModelLoader(BaseModelLoader):
         all_failed: list[str] = []
         for assignment in plan:
             peer_name = peer_names[assignment.agent_name]
+            peer_manifest = peer_manifests[assignment.agent_name]
             # Filter local_tensors to only those assigned to this peer.
             assigned_set = set(assignment.assigned_tensors)
             peer_local = {n: t for n, t in local_tensors.items() if n in assigned_set}
             if not peer_local:
                 continue
 
-            # Build a per-peer manifest (same data, just scoped).
-            peer_manifest = {
-                n: remote_manifest[n] for n in peer_local if n in remote_manifest
+            # Scope the manifest to assigned tensors only.
+            scoped_manifest = {
+                n: peer_manifest[n] for n in peer_local if n in peer_manifest
             }
 
             failed = _issue_and_wait_transfers(
-                agent, peer_name, peer_manifest, peer_local
+                agent, peer_name, scoped_manifest, peer_local
             )
             if failed:
                 log.warning(
@@ -409,7 +415,7 @@ class LayercastModelLoader(BaseModelLoader):
             ):
                 return False
 
-        if not _verify_checksums_all(local_tensors, remote_manifest, "multi-peer"):
+        if not _verify_checksums_all(local_tensors, first_manifest, "multi-peer"):
             return False
 
         _log_transfer_stats(t_xfer, local_tensors, f"multi-peer({len(plan)})")
