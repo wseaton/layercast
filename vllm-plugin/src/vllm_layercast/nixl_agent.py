@@ -147,6 +147,24 @@ class VramNixlAgent:
         self._weight_manifest.extend(manifest)
         log.info("vram_registered", count=len(descs))
 
+    def clear_registrations(self) -> None:
+        """Drop all tracked registrations so the next register_vram() re-registers.
+
+        Called after process_weights_after_loading() / model.to() which can
+        relocate tensor storage, invalidating previously registered addresses.
+        NIXL deregister_memory is called for each old descriptor so the agent's
+        exported metadata reflects only the final, stable VRAM layout.
+        """
+        for desc in self._registered_descs:
+            try:
+                self._agent.deregister_memory(desc)
+            except Exception as exc:
+                log.warning("deregister_memory_failed", error=str(exc))
+        self._registered_descs.clear()
+        self._registered_names.clear()
+        self._weight_manifest.clear()
+        log.info("registrations_cleared")
+
     def get_metadata(self) -> bytes:
         """Export this agent's metadata for sharing with remote agents."""
         md = self._agent.get_agent_metadata()
@@ -267,5 +285,12 @@ class VramNixlAgent:
 
     def close(self) -> None:
         """Release all registered memory and clean up."""
+        for desc in self._registered_descs:
+            try:
+                self._agent.deregister_memory(desc)
+            except Exception as exc:
+                log.warning("deregister_memory_failed", error=str(exc))
         self._registered_descs.clear()
+        self._registered_names.clear()
+        self._weight_manifest.clear()
         log.info("agent_closed", name=self._name)

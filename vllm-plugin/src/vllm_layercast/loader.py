@@ -192,6 +192,11 @@ class LayercastModelLoader(BaseModelLoader):
                 # Move computed buffers (e.g. rotary cos_sin_cache) from
                 # CPU to GPU. NIXL only transfers parameters, not buffers.
                 model = model.to(target_device)
+                # process_weights_after_loading / model.to() can relocate
+                # tensor storage (weight tying, transpositions, type casts),
+                # invalidating the NIXL registrations from the receive path.
+                # Wipe them so _publish_vram re-registers at final addresses.
+                self._nixl_agent.clear_registrations()
                 self._publish_vram(model, repo_id, revision, weight_files, tp_rank)
                 return model
             # NIXL load failed after init. This is a fatal error since
