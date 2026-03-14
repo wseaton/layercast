@@ -323,8 +323,10 @@ class LayercastModelLoader(BaseModelLoader):
     ) -> bool:
         """Transfer weights from multiple peers using the scheduler's plan.
 
-        Each PeerTransferAssignment specifies which tensors to pull from which
-        peer. This spreads the transfer load across peers for ~linear speedup.
+        Uses NIXL's two-phase prep_xfer_dlist + make_prepped_xfer API.
+        initialize_xfer re-runs populate() on every call, which corrupts
+        backend state when multiple remote agents are involved. The prepped
+        API populates once and reuses cached results via index selection.
         """
         plan = prepared.transfer_plan
         log.info(
@@ -334,8 +336,6 @@ class LayercastModelLoader(BaseModelLoader):
         )
 
         # Load metadata for all peers and build per-peer manifests.
-        # Each peer has different VRAM addresses for the same tensors,
-        # so we must use each peer's own tensor list, not a shared one.
         peer_names: dict[str, str] = {}
         peer_manifests: dict[str, dict[str, TensorInfo]] = {}
         for assignment in plan:
@@ -345,7 +345,6 @@ class LayercastModelLoader(BaseModelLoader):
             peer_manifests[assignment.agent_name] = {
                 t.name: t for t in assignment.tensors
             }
-            # Log a sample address to verify per-peer manifests differ.
             sample = assignment.tensors[0] if assignment.tensors else None
             log.info(
                 "nixl_peer_loaded",
@@ -356,8 +355,6 @@ class LayercastModelLoader(BaseModelLoader):
                 sample_addr=hex(sample.addr) if sample else "",
             )
 
-        # Use any peer's manifest for materialization (names/sizes are
-        # identical across peers, only addresses differ).
         first_manifest = peer_manifests[plan[0].agent_name]
         if not first_manifest:
             log.warning("nixl_empty_manifest")
@@ -376,45 +373,60 @@ class LayercastModelLoader(BaseModelLoader):
             peers=len(plan),
         )
 
-        # Issue transfers per peer, collect all failures.
+        # Register local VRAM and prep descriptors in one pass.
+        local_handle, local_names = agent.register_and_prep_local(local_tensors)
+        local_name_to_idx = {n: i for i, n in enumerate(local_names)}
+
+        # Issue transfers per peer using the prepped API.
         all_failed: list[str] = []
         for assignment in plan:
             peer_name = peer_names[assignment.agent_name]
             peer_manifest = peer_manifests[assignment.agent_name]
-            # Filter local_tensors to only those assigned to this peer.
             assigned_set = set(assignment.assigned_tensors)
-            peer_local = {n: t for n, t in local_tensors.items() if n in assigned_set}
-            if not peer_local:
+
+            # Build ordered descriptor list for this peer's assigned tensors.
+            # remote_entries and remote_names are in matching order.
+            remote_entries: list[tuple[int, int, int]] = []
+            remote_names: list[str] = []
+            local_indices: list[int] = []
+            for name in assigned_set:
+                if name not in peer_manifest or name not in local_name_to_idx:
+                    continue
+                info = peer_manifest[name]
+                remote_entries.append((info.addr, info.size, info.device_id))
+                remote_names.append(name)
+                local_indices.append(local_name_to_idx[name])
+
+            if not remote_entries:
                 continue
 
-            # Scope the manifest to assigned tensors only.
-            scoped_manifest = {
-                n: peer_manifest[n] for n in peer_local if n in peer_manifest
-            }
-            # Debug: log first address to verify per-peer manifests
-            first_key = next(iter(scoped_manifest), None)
-            if first_key:
-                s = scoped_manifest[first_key]
-                log.info(
-                    "nixl_peer_transfer_start",
-                    peer=peer_name,
-                    tensors=len(scoped_manifest),
-                    sample_name=first_key,
-                    sample_remote_addr=hex(s.addr),
-                    sample_local_addr=hex(peer_local[first_key].data_ptr()),
-                )
-
-            failed = _issue_and_wait_transfers(
-                agent, peer_name, scoped_manifest, peer_local
+            log.info(
+                "nixl_peer_transfer_start",
+                peer=peer_name,
+                tensors=len(remote_entries),
+                sample_name=remote_names[0],
+                sample_remote_addr=hex(remote_entries[0][0]),
+                sample_local_addr=hex(local_tensors[remote_names[0]].data_ptr()),
             )
-            if failed:
+
+            try:
+                remote_handle = agent.prep_remote_descs(peer_name, remote_entries)
+                handle = agent.read_prepped(
+                    local_handle,
+                    local_indices,
+                    remote_handle,
+                    range(len(remote_entries)),
+                )
+                agent.wait_transfer(handle)
+            except (RuntimeError, TimeoutError) as exc:
                 log.warning(
                     "nixl_peer_partial_failure",
                     peer=peer_name,
-                    failed=len(failed),
-                    assigned=len(peer_local),
+                    failed=len(remote_names),
+                    assigned=len(remote_names),
+                    error=str(exc),
                 )
-                all_failed.extend(failed)
+                all_failed.extend(remote_names)
 
         if all_failed:
             log.warning(

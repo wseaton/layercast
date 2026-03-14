@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import time
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 from vllm_layercast.checksum import is_enabled as _checksum_enabled
@@ -101,6 +102,15 @@ class VramNixlAgent:
     def name(self) -> str:
         return self._name
 
+    @staticmethod
+    def _tensor_desc(tensor: "torch.Tensor") -> tuple[int, int, int]:
+        """Extract (addr, nbytes, device_id) from a GPU tensor."""
+        return (
+            tensor.data_ptr(),
+            tensor.nelement() * tensor.element_size(),
+            tensor.device.index if tensor.device.index is not None else 0,
+        )
+
     def register_vram(self, tensors: dict[str, "torch.Tensor"]) -> None:
         """Register GPU tensors with NIXL for RDMA transfers.
 
@@ -124,9 +134,7 @@ class VramNixlAgent:
         descs: list[tuple[int, int, int, str]] = []
         manifest: list[dict[str, int | str | None]] = []
         for param_name, tensor in new_tensors.items():
-            addr = tensor.data_ptr()
-            nbytes = tensor.nelement() * tensor.element_size()
-            device_id = tensor.device.index if tensor.device.index is not None else 0
+            addr, nbytes, device_id = self._tensor_desc(tensor)
             descs.append((addr, nbytes, device_id, param_name))
             checksum = tensor_wyhash(tensor) if checksums_enabled else None
             manifest.append(
@@ -162,9 +170,7 @@ class VramNixlAgent:
             return
         descs: list[tuple[int, int, int, str]] = []
         for name, tensor in tensors.items():
-            addr = tensor.data_ptr()
-            nbytes = tensor.nelement() * tensor.element_size()
-            device_id = tensor.device.index if tensor.device.index is not None else 0
+            addr, nbytes, device_id = self._tensor_desc(tensor)
             descs.append((addr, nbytes, device_id, name))
         log.info("registering_local_vram", count=len(descs))
         reg = self._agent.register_memory(descs, mem_type="VRAM")
@@ -208,6 +214,71 @@ class VramNixlAgent:
         log.info("peer_loaded", peer=name)
         return name
 
+    def register_and_prep_local(
+        self, tensors: dict[str, "torch.Tensor"]
+    ) -> tuple[object, list[str]]:
+        """Register local VRAM and prep descriptors in a single pass.
+
+        Combines register_local_vram + prep for the two-phase transfer API.
+        Returns (prepped_handle, ordered_names) so callers can map tensor
+        names to descriptor indices for make_prepped_xfer.
+        """
+        reg_descs: list[tuple[int, int, int, str]] = []
+        prep_descs: list[tuple[int, int, int]] = []
+        names: list[str] = []
+        for name, tensor in tensors.items():
+            desc = self._tensor_desc(tensor)
+            reg_descs.append((*desc, name))
+            prep_descs.append(desc)
+            names.append(name)
+        reg = self._agent.register_memory(reg_descs, mem_type="VRAM")
+        self._local_only_descs.append(reg)
+        handle = self._agent.prep_xfer_dlist("", prep_descs, mem_type="VRAM")
+        log.info("registered_and_prepped_local", count=len(names))
+        return handle, names
+
+    def prep_remote_descs(
+        self,
+        peer_name: str,
+        manifest_entries: list[tuple[int, int, int]],
+    ) -> object:
+        """Prep remote descriptors bound to a specific peer agent.
+
+        manifest_entries: list of (addr, size, device_id) in the same order
+        as the caller's index scheme.
+        Returns a prepped_handle for make_prepped_xfer.
+        """
+        handle = self._agent.prep_xfer_dlist(
+            peer_name, manifest_entries, mem_type="VRAM"
+        )
+        log.info("prepped_remote_descs", peer=peer_name, count=len(manifest_entries))
+        return handle
+
+    def read_prepped(
+        self,
+        local_handle: object,
+        local_indices: Sequence[int],
+        remote_handle: object,
+        remote_indices: Sequence[int],
+    ) -> object:
+        """Issue a transfer using pre-prepared descriptor handles.
+
+        Uses make_prepped_xfer (two-phase API) instead of initialize_xfer.
+        This avoids re-running populate() on descriptors, which is required
+        for correct multi-agent transfers.
+
+        Returns a transfer handle for wait_transfer().
+        """
+        handle = self._agent.make_prepped_xfer(
+            "READ",
+            local_handle,
+            local_indices,
+            remote_handle,
+            remote_indices,
+        )
+        self._agent.transfer(handle)
+        return handle
+
     def read_from_peer(
         self,
         local_tensor: "torch.Tensor",
@@ -220,14 +291,8 @@ class VramNixlAgent:
 
         Returns a transfer handle that should be passed to wait_transfer().
         """
-        local_addr = local_tensor.data_ptr()
-        local_len = local_tensor.nelement() * local_tensor.element_size()
-        local_device = (
-            local_tensor.device.index if local_tensor.device.index is not None else 0
-        )
-
         local_descs = self._agent.get_xfer_descs(
-            [(local_addr, local_len, local_device)],
+            [self._tensor_desc(local_tensor)],
             mem_type="VRAM",
         )
         remote_descs = self._agent.get_xfer_descs(
@@ -259,11 +324,7 @@ class VramNixlAgent:
 
         Returns a transfer handle for wait_transfer().
         """
-        local_base = local_buf.data_ptr()
-        local_device = (
-            local_buf.device.index if local_buf.device.index is not None else 0
-        )
-
+        local_base, _, local_device = self._tensor_desc(local_buf)
         local_descs_raw = [
             (local_base + off, length, local_device)
             for off, (_, length, _) in zip(offsets, remote_regions)
