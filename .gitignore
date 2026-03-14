@@ -8,5 +8,6 @@ target/
 .venv/
 *.pyc
 benchmark-logs/
+bug-reports/
 .ruff_cache/
 __pycache__/
