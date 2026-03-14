@@ -484,16 +484,16 @@ class TestWaitTransfer:
             agent.wait_transfer("h")
 
 
-# clear_registrations tests
+# register_local_vram tests
 
 
-class TestClearRegistrations:
-    """Test VramNixlAgent.clear_registrations for multi-peer re-registration.
+class TestRegisterLocalVram:
+    """Test VramNixlAgent.register_local_vram for receive-side registration.
 
-    When a pod receives weights via NIXL and then calls
-    process_weights_after_loading() / model.to(), tensor addresses can change.
-    clear_registrations() must deregister stale NIXL descriptors and reset
-    tracking so _publish_vram re-registers at the final, stable addresses.
+    The receive path needs NIXL memory registration for destination buffers,
+    but must NOT pollute _registered_names or _weight_manifest. Otherwise
+    the subsequent _publish_vram call skips re-registration (dedup), and
+    the metadata blob advertised to peers lacks proper serving registrations.
     """
 
     def _make_agent(self) -> "VramNixlAgent":
@@ -526,70 +526,46 @@ class TestClearRegistrations:
         t.dtype = "torch.bfloat16"
         return t
 
-    def test_clear_deregisters_and_resets_tracking(self) -> None:
+    def test_local_vram_does_not_pollute_tracking(self) -> None:
+        """register_local_vram must not touch _registered_names or _weight_manifest."""
         agent = self._make_agent()
-        reg_handle = MagicMock()
-        agent._agent.register_memory.return_value = reg_handle
+        agent._agent.register_memory.return_value = MagicMock()
 
-        # Simulate receive-path registration (addresses before post-processing)
+        agent.register_local_vram({"w0": self._fake_tensor(0xA000, 4096)})
+
+        assert "w0" not in agent._registered_names
+        assert agent._weight_manifest == []
+        # But NIXL registration DID happen
+        agent._agent.register_memory.assert_called_once()
+
+    def test_local_vram_allows_subsequent_register_vram(self) -> None:
+        """After register_local_vram, register_vram should still register the same names."""
+        agent = self._make_agent()
+        agent._agent.register_memory.return_value = MagicMock()
+
+        # Receive path: local-only registration
+        agent.register_local_vram({"w0": self._fake_tensor(0xA000, 4096)})
+
+        # Publish path: full registration with manifest
         agent.register_vram({"w0": self._fake_tensor(0xA000, 4096)})
+
         assert "w0" in agent._registered_names
         assert len(agent._weight_manifest) == 1
         assert agent._weight_manifest[0]["addr"] == 0xA000
+        # Two register_memory calls: one local, one for serving
+        assert agent._agent.register_memory.call_count == 2
 
-        # Clear (simulates what happens after process_weights_after_loading)
-        agent.clear_registrations()
-
-        assert agent._registered_names == set()
-        assert agent._weight_manifest == []
-        assert agent._registered_descs == []
-        agent._agent.deregister_memory.assert_called_once_with(reg_handle)
-
-    def test_clear_allows_reregistration_at_new_address(self) -> None:
-        """The whole point: after clear, register_vram accepts the same names."""
+    def test_local_vram_stores_desc_handle(self) -> None:
+        """Descriptor handle is stored for cleanup in close()."""
         agent = self._make_agent()
-        agent._agent.register_memory.return_value = MagicMock()
+        handle = MagicMock()
+        agent._agent.register_memory.return_value = handle
 
-        # First registration (receive-path, pre-post-processing address)
-        agent.register_vram({"w0": self._fake_tensor(0xA000, 4096)})
-        assert agent._weight_manifest[0]["addr"] == 0xA000
-
-        agent.clear_registrations()
-
-        # Second registration (publish-path, post-post-processing address)
-        agent.register_vram({"w0": self._fake_tensor(0xB000, 4096)})
-        assert len(agent._weight_manifest) == 1
-        assert agent._weight_manifest[0]["addr"] == 0xB000
-
-    def test_clear_handles_multiple_descs(self) -> None:
-        agent = self._make_agent()
-        handles = [MagicMock(), MagicMock()]
-        agent._agent.register_memory.side_effect = handles
-
-        agent.register_vram({"w0": self._fake_tensor(0xA000, 4096)})
-        agent.register_vram({"w1": self._fake_tensor(0xC000, 2048)})
-        assert len(agent._registered_descs) == 2
-
-        agent.clear_registrations()
-        assert agent._agent.deregister_memory.call_count == 2
-        agent._agent.deregister_memory.assert_any_call(handles[0])
-        agent._agent.deregister_memory.assert_any_call(handles[1])
-
-    def test_clear_survives_deregister_failure(self) -> None:
-        """If NIXL deregister blows up, we still reset tracking."""
-        agent = self._make_agent()
-        agent._agent.register_memory.return_value = MagicMock()
-        agent._agent.deregister_memory.side_effect = RuntimeError("UCX sad")
-
-        agent.register_vram({"w0": self._fake_tensor(0xA000, 4096)})
-        agent.clear_registrations()
-
-        # Tracking still cleared despite the error
-        assert agent._registered_names == set()
-        assert agent._weight_manifest == []
+        agent.register_local_vram({"w0": self._fake_tensor(0xA000, 4096)})
+        assert handle in agent._registered_descs
 
     def test_close_deregisters_memory(self) -> None:
-        """close() should also deregister, not just clear the list."""
+        """close() should deregister all memory including local-only."""
         agent = self._make_agent()
         reg_handle = MagicMock()
         agent._agent.register_memory.return_value = reg_handle

@@ -192,11 +192,6 @@ class LayercastModelLoader(BaseModelLoader):
                 # Move computed buffers (e.g. rotary cos_sin_cache) from
                 # CPU to GPU. NIXL only transfers parameters, not buffers.
                 model = model.to(target_device)
-                # process_weights_after_loading / model.to() can relocate
-                # tensor storage (weight tying, transpositions, type casts),
-                # invalidating the NIXL registrations from the receive path.
-                # Wipe them so _publish_vram re-registers at final addresses.
-                self._nixl_agent.clear_registrations()
                 self._publish_vram(model, repo_id, revision, weight_files, tp_rank)
                 return model
             # NIXL load failed after init. This is a fatal error since
@@ -688,7 +683,7 @@ def _issue_and_wait_transfers(
         else:
             large_tensors[name] = tensor
 
-    agent.register_vram(large_tensors)
+    agent.register_local_vram(large_tensors)
 
     handles: list[tuple[str | list[str], object]] = []
     failed: list[str] = []
@@ -697,7 +692,7 @@ def _issue_and_wait_transfers(
     if small_entries:
         total_small = sum(t.nelement() * t.element_size() for _, t in small_entries)
         coalesce_buf = torch.empty(total_small, dtype=torch.uint8, device=device)
-        agent.register_vram({"__coalesced__": coalesce_buf})
+        agent.register_local_vram({"__coalesced__": coalesce_buf})
 
         remote_regions: list[tuple[int, int, int]] = []
         offsets: list[int] = []

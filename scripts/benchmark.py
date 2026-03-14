@@ -785,6 +785,16 @@ def run_nfs_cached(
     return result
 
 
+def _apply_metadata_server(k8s: K8sRunner, mesh_image: str | None) -> None:
+    """Apply the metadata-server kustomize, optionally overriding the image."""
+    _run([*k8s.kubectl, "apply", "-k", "deploy/metadata-server/"])
+    if mesh_image:
+        _run([*k8s.kubectl, "set", "image",
+              "deployment/metadata-server",
+              f"metadata-server={mesh_image}"])
+        info(f"Overrode metadata-server image: {mesh_image}")
+
+
 def run_nixl_p2p(
     k8s: K8sRunner, cfg: BenchConfig, log_dir: Path,
 ) -> ScenarioResult:
@@ -796,7 +806,7 @@ def run_nixl_p2p(
     tmpl_kwargs = dict(model=cfg.model, vllm_image=cfg.vllm_image)
 
     # Ensure metadata server + PVC
-    _run([*k8s.kubectl, "apply", "-k", "deploy/metadata-server/"])
+    _apply_metadata_server(k8s, cfg.mesh_image)
     k8s.apply_raw(f"{cfg.deploy_dir}/pvc.yaml")
 
     k8s.delete_template(yaml_path, **tmpl_kwargs)
@@ -840,7 +850,7 @@ def run_nixl_scaling(
     tmpl_kwargs = dict(model=cfg.model, vllm_image=cfg.vllm_image)
 
     # Ensure metadata server + PVC
-    _run([*k8s.kubectl, "apply", "-k", "deploy/metadata-server/"])
+    _apply_metadata_server(k8s, cfg.mesh_image)
     k8s.apply_raw(f"{cfg.deploy_dir}/pvc.yaml")
 
     k8s.delete_template(yaml_path, **tmpl_kwargs)
@@ -938,6 +948,7 @@ class BenchConfig:
     skip_nixl: bool = False
     skip_nixl_scaling: bool = False
     skip_populate: bool = False
+    mesh_image: str | None = None
 
 
 def info(msg: str) -> None:
@@ -953,6 +964,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model", default=os.environ.get("BENCH_MODEL", "Qwen/Qwen2.5-32B"))
     p.add_argument("--vllm-image", default=os.environ.get(
         "VLLM_IMAGE", "ghcr.io/wseaton/layercast:vllm-plugin-feat-central-metadata-server"))
+    p.add_argument("--mesh-image", default=os.environ.get("MESH_IMAGE"),
+                    help="Override metadata-server image (default: use kustomize value)")
     p.add_argument("--context", default=os.environ.get("KUBE_CONTEXT", "coreweave-waldorf"))
     p.add_argument("--namespace", default=os.environ.get("BENCH_NS", "layercast"))
     p.add_argument("--skip-hf", action="store_true")
@@ -1023,6 +1036,7 @@ def main() -> None:
         skip_nixl=args.skip_nixl,
         skip_nixl_scaling=args.skip_nixl_scaling,
         skip_populate=args.skip_populate,
+        mesh_image=args.mesh_image,
     )
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -1032,6 +1046,8 @@ def main() -> None:
     info("Benchmark configuration:")
     info(f"  Model:      {cfg.model}")
     info(f"  vLLM image: {cfg.vllm_image}")
+    if cfg.mesh_image:
+        info(f"  Mesh image: {cfg.mesh_image}")
     info(f"  Context:    {cfg.context}")
     info(f"  Namespace:  {cfg.namespace}")
     info(f"  Log dir:    {log_dir}")

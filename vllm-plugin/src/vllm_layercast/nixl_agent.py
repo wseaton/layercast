@@ -147,23 +147,27 @@ class VramNixlAgent:
         self._weight_manifest.extend(manifest)
         log.info("vram_registered", count=len(descs))
 
-    def clear_registrations(self) -> None:
-        """Drop all tracked registrations so the next register_vram() re-registers.
+    def register_local_vram(self, tensors: dict[str, "torch.Tensor"]) -> None:
+        """Register GPU tensors as local NIXL destinations only.
 
-        Called after process_weights_after_loading() / model.to() which can
-        relocate tensor storage, invalidating previously registered addresses.
-        NIXL deregister_memory is called for each old descriptor so the agent's
-        exported metadata reflects only the final, stable VRAM layout.
+        Used by the receive path (_issue_and_wait_transfers) to register
+        destination buffers for inbound NIXL READs. Does NOT update
+        _registered_names or _weight_manifest, so a subsequent register_vram
+        call in _publish_vram will re-register these tensors for serving
+        with the correct manifest entries and metadata export.
         """
-        for desc in self._registered_descs:
-            try:
-                self._agent.deregister_memory(desc)
-            except Exception as exc:
-                log.warning("deregister_memory_failed", error=str(exc))
-        self._registered_descs.clear()
-        self._registered_names.clear()
-        self._weight_manifest.clear()
-        log.info("registrations_cleared")
+        if not tensors:
+            return
+        descs: list[tuple[int, int, int, str]] = []
+        for name, tensor in tensors.items():
+            addr = tensor.data_ptr()
+            nbytes = tensor.nelement() * tensor.element_size()
+            device_id = tensor.device.index if tensor.device.index is not None else 0
+            descs.append((addr, nbytes, device_id, name))
+        log.info("registering_local_vram", count=len(descs))
+        reg = self._agent.register_memory(descs, mem_type="VRAM")
+        self._registered_descs.append(reg)
+        log.info("local_vram_registered", count=len(descs))
 
     def get_metadata(self) -> bytes:
         """Export this agent's metadata for sharing with remote agents."""
