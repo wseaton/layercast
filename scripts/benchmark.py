@@ -104,6 +104,9 @@ class TransferMetrics:
     checksum_s: float | None = None
     compile_cache_gets: int | None = None
     compile_cache_hits: int | None = None
+    local_reg_s: float | None = None
+    serve_reg_s: float | None = None
+    total_reg_s: float | None = None
 
 
 @dataclass
@@ -438,6 +441,56 @@ def extract_log_field(log_path: Path, event: str, field_name: str) -> str | None
         return None
 
 
+def extract_event_timestamp(log_path: Path, event: str, *, first: bool = True) -> datetime | None:
+    """Extract the timestamp from the first or last matching structured log event."""
+    if not log_path.exists():
+        return None
+
+    match: str | None = None
+    for line in log_path.read_text(errors="replace").splitlines():
+        if f'"event": "{event}"' not in line:
+            continue
+        if first and match is None:
+            match = line
+        else:
+            match = line
+        if first and match is not None:
+            break
+
+    if not match:
+        return None
+
+    cleaned = _ANSI_RE.sub("", match)
+    m = re.search(r"\{.*\}", cleaned)
+    if not m:
+        return None
+
+    try:
+        data = json.loads(m.group())
+        ts = data.get("timestamp")
+        if ts:
+            return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return None
+
+
+def extract_reg_times(log_path: Path) -> tuple[float | None, float | None]:
+    """Extract local and serve VRAM registration durations from log timestamps.
+
+    Returns (local_reg_s, serve_reg_s). Each is the wall-clock time
+    between the first 'registering_*' and the last '*_registered' event.
+    """
+    local_start = extract_event_timestamp(log_path, "registering_local_vram", first=True)
+    local_end = extract_event_timestamp(log_path, "local_vram_registered", first=False)
+    serve_start = extract_event_timestamp(log_path, "registering_vram", first=True)
+    serve_end = extract_event_timestamp(log_path, "vram_registered", first=False)
+
+    local_s = (local_end - local_start).total_seconds() if local_start and local_end else None
+    serve_s = (serve_end - serve_start).total_seconds() if serve_start and serve_end else None
+    return local_s, serve_s
+
+
 def extract_metrics(log_path: Path) -> TransferMetrics:
     """Extract all transfer metrics from a log file."""
     metrics = TransferMetrics()
@@ -469,6 +522,12 @@ def extract_metrics(log_path: Path) -> TransferMetrics:
             metrics.checksum_s = float(raw)
         except ValueError:
             pass
+
+    local_s, serve_s = extract_reg_times(log_path)
+    metrics.local_reg_s = local_s
+    metrics.serve_reg_s = serve_s
+    if local_s is not None or serve_s is not None:
+        metrics.total_reg_s = (local_s or 0.0) + (serve_s or 0.0)
 
     return metrics
 
@@ -654,6 +713,7 @@ def format_markdown_table(run: BenchmarkRun) -> str:
         ("Scenario", 25),
         ("TTR (s)", 10),
         ("Weight Load (s)", 16),
+        ("Reg (s)", 10),
         ("Throughput", 12),
         ("Model Size", 12),
         ("Checksum (s)", 13),
@@ -666,6 +726,7 @@ def format_markdown_table(run: BenchmarkRun) -> str:
     for r in run.results:
         ttr = f"{r.ttr_s:.1f}" if r.ttr_s is not None else "N/A"
         wl = f"{r.metrics.weight_load_s:.1f}" if r.metrics.weight_load_s is not None else "N/A"
+        reg = f"{r.metrics.total_reg_s:.1f}" if r.metrics.total_reg_s is not None else "N/A"
         gbps = f"{r.metrics.transfer_gbps:.1f} GB/s" if r.metrics.transfer_gbps is not None else "N/A"
         model_gb = f"{r.metrics.transfer_bytes / 1e9:.1f} GB" if r.metrics.transfer_bytes else "N/A"
         cksum = f"{r.metrics.checksum_s:.1f}" if r.metrics.checksum_s is not None else "N/A"
@@ -679,6 +740,7 @@ def format_markdown_table(run: BenchmarkRun) -> str:
             (r.scenario, 25),
             (ttr, 10),
             (wl, 16),
+            (reg, 10),
             (gbps, 12),
             (model_gb, 12),
             (cksum, 13),

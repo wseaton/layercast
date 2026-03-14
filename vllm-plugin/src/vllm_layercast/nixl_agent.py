@@ -156,6 +156,78 @@ class VramNixlAgent:
         self._weight_manifest.extend(manifest)
         log.info("vram_registered", count=len(descs))
 
+    def register_vram_early(self, tensors: dict[str, "torch.Tensor"]) -> None:
+        """Register GPU tensors with NIXL before data arrives.
+
+        Like register_vram but skips checksum computation. Used when tensors
+        are allocated but not yet filled (e.g. before RDMA transfer). The
+        manifest is built with checksum=None; call finalize_manifest() after
+        data arrives to fill in checksums.
+
+        This lets us register VRAM once for both receiving transfers AND
+        serving to peers, eliminating the receive-side register + deregister
+        cycle (~5s saved on 258 tensors).
+        """
+        if not tensors:
+            return
+
+        new_tensors = {
+            name: t for name, t in tensors.items() if name not in self._registered_names
+        }
+        if not new_tensors:
+            log.debug(
+                "register_vram_early_skipped",
+                count=len(tensors),
+                reason="already_registered",
+            )
+            return
+
+        descs: list[tuple[int, int, int, str]] = []
+        manifest: list[dict[str, int | str | None]] = []
+        for param_name, tensor in new_tensors.items():
+            addr, nbytes, device_id = self._tensor_desc(tensor)
+            descs.append((addr, nbytes, device_id, param_name))
+            manifest.append(
+                {
+                    "name": param_name,
+                    "addr": addr,
+                    "size": nbytes,
+                    "device_id": device_id,
+                    "dtype": str(tensor.dtype),
+                    "checksum": None,
+                }
+            )
+
+        already = len(tensors) - len(new_tensors)
+        log.info("registering_vram", new=len(descs), already_registered=already)
+        reg = self._agent.register_memory(descs, mem_type="VRAM")
+        self._registered_descs.append(reg)
+        self._registered_names.update(new_tensors.keys())
+        self._weight_manifest.extend(manifest)
+        log.info("vram_registered", count=len(descs))
+
+    def finalize_manifest(self, tensors: dict[str, "torch.Tensor"]) -> None:
+        """Fill in checksums for tensors registered via register_vram_early.
+
+        Call after data has been written to the tensors (e.g. after RDMA
+        transfer completes). Only computes checksums if enabled.
+        """
+        if not _checksum_enabled():
+            return
+
+        name_to_tensor = tensors
+        updated = 0
+        for entry in self._weight_manifest:
+            name = entry["name"]
+            if entry["checksum"] is not None:
+                continue
+            tensor = name_to_tensor.get(str(name))
+            if tensor is not None:
+                entry["checksum"] = tensor_wyhash(tensor)
+                updated += 1
+        if updated:
+            log.info("manifest_checksums_computed", count=updated)
+
     def register_local_vram(self, tensors: dict[str, "torch.Tensor"]) -> None:
         """Register GPU tensors as local NIXL destinations only.
 

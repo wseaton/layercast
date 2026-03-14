@@ -123,6 +123,12 @@ class LayercastModelLoader(BaseModelLoader):
             loaded = True
             elapsed = time.monotonic() - t_start
             log.info("weights_loaded", method="nixl", elapsed_s=elapsed, model=repo_id)
+            # Clean up coalesced receive buffer, finalize checksums
+            if self._nixl_agent:
+                self._nixl_agent.deregister_local_vram()
+                self._nixl_agent.finalize_manifest(
+                    {n: p.data for n, p in model.named_parameters() if p.is_cuda}
+                )
 
         # fall back to vLLM default, either local fs or HF download
         if not loaded:
@@ -197,11 +203,14 @@ class LayercastModelLoader(BaseModelLoader):
                 # Move computed buffers (e.g. rotary cos_sin_cache) from
                 # CPU to GPU. NIXL only transfers parameters, not buffers.
                 model = model.to(target_device)
-                # Deregister receive-side VRAM before publishing. NIXL's
-                # get_agent_metadata() includes ALL registered memory, and
-                # overlapping receive+serve registrations for the same
-                # addresses cause ERR_NOT_ALLOWED on consuming peers.
+                # Deregister only the coalesced receive buffer (if any).
+                # Large tensors were registered as serve-side upfront via
+                # register_vram_early, so no deregister + re-register needed.
                 self._nixl_agent.deregister_local_vram()
+                # Finalize checksums now that data has arrived, then publish.
+                self._nixl_agent.finalize_manifest(
+                    {n: p.data for n, p in model.named_parameters() if p.is_cuda}
+                )
                 self._publish_vram(model, repo_id, revision, weight_files, tp_rank)
                 return model
             # NIXL load failed after init. This is a fatal error since
@@ -290,8 +299,18 @@ class LayercastModelLoader(BaseModelLoader):
             remote=len(remote_manifest),
         )
 
+        # Register ALL tensors as serve-side upfront. NIXL register_memory
+        # just pins GPU pages with the RDMA NIC, it works for both receiving
+        # and serving. This eliminates the separate receive-side registration
+        # (~5.3s for 258 large tensors) by reusing the same registration.
+        agent.register_vram_early(local_tensors)
+
         failed = _issue_and_wait_transfers(
-            agent, peer_name, remote_manifest, local_tensors
+            agent,
+            peer_name,
+            remote_manifest,
+            local_tensors,
+            skip_large_registration=True,
         )
 
         if failed:
@@ -731,11 +750,17 @@ def _issue_and_wait_transfers(
     peer_name: str,
     remote_manifest: dict[str, TensorInfo],
     local_tensors: dict[str, "torch.Tensor"],
+    *,
+    skip_large_registration: bool = False,
 ) -> list[str]:
     """Issue NIXL reads and wait for completion. Returns names of failed tensors.
 
     Splits tensors into large (individual) and small (coalesced) transfers.
     On failure, collects the tensor names that failed rather than aborting.
+
+    When skip_large_registration is True, large tensors are assumed to be
+    already registered with NIXL (e.g. via register_vram_early). Only the
+    coalesced buffer for small tensors needs local-only registration.
     """
     device = f"cuda:{torch.cuda.current_device()}"
     large_tensors: dict[str, torch.Tensor] = {}
@@ -747,7 +772,8 @@ def _issue_and_wait_transfers(
         else:
             large_tensors[name] = tensor
 
-    agent.register_local_vram(large_tensors)
+    if not skip_large_registration:
+        agent.register_local_vram(large_tensors)
 
     handles: list[tuple[str | list[str], object]] = []
     failed: list[str] = []
