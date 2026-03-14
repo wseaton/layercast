@@ -377,15 +377,16 @@ class LayercastModelLoader(BaseModelLoader):
         local_handle, local_names = agent.register_and_prep_local(local_tensors)
         local_name_to_idx = {n: i for i, n in enumerate(local_names)}
 
-        # Issue transfers per peer using the prepped API.
+        # Prep and issue all peer transfers, then wait for all at once.
+        # Issuing before waiting overlaps RDMA from multiple peers for
+        # ~linear speedup (each peer saturates a different IB port).
         all_failed: list[str] = []
+        in_flight: list[tuple[str, list[str], object]] = []
         for assignment in plan:
             peer_name = peer_names[assignment.agent_name]
             peer_manifest = peer_manifests[assignment.agent_name]
             assigned_set = set(assignment.assigned_tensors)
 
-            # Build ordered descriptor list for this peer's assigned tensors.
-            # remote_entries and remote_names are in matching order.
             remote_entries: list[tuple[int, int, int]] = []
             remote_names: list[str] = []
             local_indices: list[int] = []
@@ -417,6 +418,19 @@ class LayercastModelLoader(BaseModelLoader):
                     remote_handle,
                     range(len(remote_entries)),
                 )
+                in_flight.append((peer_name, remote_names, handle))
+            except RuntimeError as exc:
+                log.warning(
+                    "nixl_peer_prep_failed",
+                    peer=peer_name,
+                    failed=len(remote_names),
+                    error=str(exc),
+                )
+                all_failed.extend(remote_names)
+
+        # Wait for all in-flight transfers to complete.
+        for peer_name, remote_names, handle in in_flight:
+            try:
                 agent.wait_transfer(handle)
             except (RuntimeError, TimeoutError) as exc:
                 log.warning(
