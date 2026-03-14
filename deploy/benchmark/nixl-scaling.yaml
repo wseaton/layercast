@@ -5,16 +5,15 @@
 #   - c1: loads weights via NIXL from seed, populates compile cache (NIXL path)
 #   - c2: loads via NIXL, gets full compile cache hits from c1 (same code path)
 #
+# Requires the metadata-server to be deployed first:
+#   kubectl apply -k deploy/metadata-server/
+#
 # Shows: NIXL transfer scales, compile cache eliminates ~13s compile time.
 #
 # Substitution vars (via envsubst in benchmark.sh):
 #   ${BENCH_MODEL}      - HF model ID (e.g. "Qwen/Qwen2.5-32B")
 #
 # Images set via kustomize (see deploy/benchmark/kustomization.yaml).
-
-# ── Shared container templates (YAML anchors) ──────────────────────────
-# DRY: the model-mesh and vllm containers are identical across all three
-# pods except for PEER_DISCOVERY_TIMEOUT on the seed.
 
 ---
 # Seed: loads from HF, publishes NIXL VRAM metadata for consumers.
@@ -36,74 +35,9 @@ spec:
       labels:
         app: bench
         bench/scenario: scale-seed
+        layercast.io/managed: "true"
     spec:
-      serviceAccountName: model-mesh
       containers:
-        - name: model-mesh
-          image: model-mesh:latest
-          imagePullPolicy: Always
-          securityContext:
-            runAsUser: 2000
-            capabilities:
-              add: ["IPC_LOCK"]
-          ports:
-            - containerPort: 7903
-              name: nixl-control
-          env:
-            - name: NODE_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
-            - name: HF_UPSTREAM
-              value: https://huggingface.co
-            - name: RUST_LOG
-              value: model_mesh=debug,transport=debug,discovery=debug
-            - name: POD_IP
-              valueFrom:
-                fieldRef:
-                  fieldPath: status.podIP
-            - name: RUST_BACKTRACE
-              value: "1"
-            - name: IPC_SOCKET_PATH
-              value: /var/run/layercast/daemon.sock
-            - name: NIXL_CONTROL_PORT
-              value: "7903"
-            - name: COMPILE_CACHE_ENABLED
-              value: "true"
-            - name: COMPILE_CACHE_ADDR
-              value: "127.0.0.1:6379"
-            - name: MODEL_NAME
-              value: ${BENCH_MODEL}
-            - name: PEER_DISCOVERY_TIMEOUT
-              value: "0"
-            - name: POD_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
-            - name: POD_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
-          readinessProbe:
-            httpGet:
-              path: /healthz
-              port: 8081
-            initialDelaySeconds: 5
-            periodSeconds: 5
-            timeoutSeconds: 2
-          resources:
-            requests:
-              memory: "4Gi"
-              cpu: "2"
-            limits:
-              memory: "8Gi"
-              cpu: "4"
-          volumeMounts:
-            - name: ipc-socket
-              mountPath: /var/run/layercast
-            - name: compile-cache
-              mountPath: /var/cache/layercast/compile-cache
-
         - name: vllm
           image: vllm-plugin:latest
           imagePullPolicy: Always
@@ -119,8 +53,16 @@ spec:
             - containerPort: 8000
               name: http
           env:
-            - name: LAYERCAST_SOCKET
-              value: /var/run/layercast/daemon.sock
+            - name: LAYERCAST_SERVER_ADDR
+              value: layercast-metadata-server.layercast.svc.cluster.local:50051
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
             - name: CUDA_VISIBLE_DEVICES
               value: "0"
             - name: FLASHINFER_WORKSPACE_DIR
@@ -130,7 +72,7 @@ spec:
             - name: TORCHINDUCTOR_FX_GRAPH_REMOTE_CACHE
               value: "1"
             - name: TORCHINDUCTOR_REDIS_HOST
-              value: "127.0.0.1"
+              value: layercast-metadata-server.layercast.svc.cluster.local
             - name: TORCHINDUCTOR_REDIS_PORT
               value: "6379"
             - name: NO_COLOR
@@ -150,8 +92,6 @@ spec:
               nvidia.com/gpu: 1
               rdma/ib: 1
           volumeMounts:
-            - name: ipc-socket
-              mountPath: /var/run/layercast
             - name: shm
               mountPath: /dev/shm
           readinessProbe:
@@ -163,15 +103,10 @@ spec:
             timeoutSeconds: 5
 
       volumes:
-        - name: ipc-socket
-          emptyDir: {}
         - name: shm
           emptyDir:
             medium: Memory
             sizeLimit: 4Gi
-        - name: compile-cache
-          emptyDir:
-            sizeLimit: 10Gi
 
 ---
 # Consumer-1: waits for seed, loads via NIXL, populates compile cache.
@@ -193,8 +128,8 @@ spec:
       labels:
         app: bench
         bench/scenario: scale-c1
+        layercast.io/managed: "true"
     spec:
-      serviceAccountName: model-mesh
       initContainers:
         - name: wait-for-seed
           image: curlimages/curl:latest
@@ -209,69 +144,6 @@ spec:
               done
               echo "Seed is ready!"
       containers:
-        - name: model-mesh
-          image: model-mesh:latest
-          imagePullPolicy: Always
-          securityContext:
-            runAsUser: 2000
-            capabilities:
-              add: ["IPC_LOCK"]
-          ports:
-            - containerPort: 7903
-              name: nixl-control
-          env:
-            - name: NODE_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
-            - name: HF_UPSTREAM
-              value: https://huggingface.co
-            - name: RUST_LOG
-              value: model_mesh=debug,transport=debug,discovery=debug
-            - name: POD_IP
-              valueFrom:
-                fieldRef:
-                  fieldPath: status.podIP
-            - name: RUST_BACKTRACE
-              value: "1"
-            - name: IPC_SOCKET_PATH
-              value: /var/run/layercast/daemon.sock
-            - name: NIXL_CONTROL_PORT
-              value: "7903"
-            - name: COMPILE_CACHE_ENABLED
-              value: "true"
-            - name: COMPILE_CACHE_ADDR
-              value: "127.0.0.1:6379"
-            - name: MODEL_NAME
-              value: ${BENCH_MODEL}
-            - name: POD_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
-            - name: POD_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
-          readinessProbe:
-            httpGet:
-              path: /healthz
-              port: 8081
-            initialDelaySeconds: 5
-            periodSeconds: 5
-            timeoutSeconds: 2
-          resources:
-            requests:
-              memory: "4Gi"
-              cpu: "2"
-            limits:
-              memory: "8Gi"
-              cpu: "4"
-          volumeMounts:
-            - name: ipc-socket
-              mountPath: /var/run/layercast
-            - name: compile-cache
-              mountPath: /var/cache/layercast/compile-cache
-
         - name: vllm
           image: vllm-plugin:latest
           imagePullPolicy: Always
@@ -287,8 +159,16 @@ spec:
             - containerPort: 8000
               name: http
           env:
-            - name: LAYERCAST_SOCKET
-              value: /var/run/layercast/daemon.sock
+            - name: LAYERCAST_SERVER_ADDR
+              value: layercast-metadata-server.layercast.svc.cluster.local:50051
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
             - name: CUDA_VISIBLE_DEVICES
               value: "0"
             - name: FLASHINFER_WORKSPACE_DIR
@@ -298,7 +178,7 @@ spec:
             - name: TORCHINDUCTOR_FX_GRAPH_REMOTE_CACHE
               value: "1"
             - name: TORCHINDUCTOR_REDIS_HOST
-              value: "127.0.0.1"
+              value: layercast-metadata-server.layercast.svc.cluster.local
             - name: TORCHINDUCTOR_REDIS_PORT
               value: "6379"
             - name: NO_COLOR
@@ -318,8 +198,6 @@ spec:
               nvidia.com/gpu: 1
               rdma/ib: 1
           volumeMounts:
-            - name: ipc-socket
-              mountPath: /var/run/layercast
             - name: shm
               mountPath: /dev/shm
           readinessProbe:
@@ -331,15 +209,10 @@ spec:
             timeoutSeconds: 5
 
       volumes:
-        - name: ipc-socket
-          emptyDir: {}
         - name: shm
           emptyDir:
             medium: Memory
             sizeLimit: 4Gi
-        - name: compile-cache
-          emptyDir:
-            sizeLimit: 10Gi
 
 ---
 # Consumer-2: waits for c1, loads via NIXL, should get full compile cache hits.
@@ -361,8 +234,8 @@ spec:
       labels:
         app: bench
         bench/scenario: scale-c2
+        layercast.io/managed: "true"
     spec:
-      serviceAccountName: model-mesh
       initContainers:
         - name: wait-for-c1
           image: curlimages/curl:latest
@@ -377,69 +250,6 @@ spec:
               done
               echo "Consumer-1 is ready!"
       containers:
-        - name: model-mesh
-          image: model-mesh:latest
-          imagePullPolicy: Always
-          securityContext:
-            runAsUser: 2000
-            capabilities:
-              add: ["IPC_LOCK"]
-          ports:
-            - containerPort: 7903
-              name: nixl-control
-          env:
-            - name: NODE_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
-            - name: HF_UPSTREAM
-              value: https://huggingface.co
-            - name: RUST_LOG
-              value: model_mesh=debug,transport=debug,discovery=debug
-            - name: POD_IP
-              valueFrom:
-                fieldRef:
-                  fieldPath: status.podIP
-            - name: RUST_BACKTRACE
-              value: "1"
-            - name: IPC_SOCKET_PATH
-              value: /var/run/layercast/daemon.sock
-            - name: NIXL_CONTROL_PORT
-              value: "7903"
-            - name: COMPILE_CACHE_ENABLED
-              value: "true"
-            - name: COMPILE_CACHE_ADDR
-              value: "127.0.0.1:6379"
-            - name: MODEL_NAME
-              value: ${BENCH_MODEL}
-            - name: POD_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
-            - name: POD_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
-          readinessProbe:
-            httpGet:
-              path: /healthz
-              port: 8081
-            initialDelaySeconds: 5
-            periodSeconds: 5
-            timeoutSeconds: 2
-          resources:
-            requests:
-              memory: "4Gi"
-              cpu: "2"
-            limits:
-              memory: "8Gi"
-              cpu: "4"
-          volumeMounts:
-            - name: ipc-socket
-              mountPath: /var/run/layercast
-            - name: compile-cache
-              mountPath: /var/cache/layercast/compile-cache
-
         - name: vllm
           image: vllm-plugin:latest
           imagePullPolicy: Always
@@ -455,8 +265,16 @@ spec:
             - containerPort: 8000
               name: http
           env:
-            - name: LAYERCAST_SOCKET
-              value: /var/run/layercast/daemon.sock
+            - name: LAYERCAST_SERVER_ADDR
+              value: layercast-metadata-server.layercast.svc.cluster.local:50051
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
             - name: CUDA_VISIBLE_DEVICES
               value: "0"
             - name: FLASHINFER_WORKSPACE_DIR
@@ -466,7 +284,7 @@ spec:
             - name: TORCHINDUCTOR_FX_GRAPH_REMOTE_CACHE
               value: "1"
             - name: TORCHINDUCTOR_REDIS_HOST
-              value: "127.0.0.1"
+              value: layercast-metadata-server.layercast.svc.cluster.local
             - name: TORCHINDUCTOR_REDIS_PORT
               value: "6379"
             - name: NO_COLOR
@@ -486,8 +304,6 @@ spec:
               nvidia.com/gpu: 1
               rdma/ib: 1
           volumeMounts:
-            - name: ipc-socket
-              mountPath: /var/run/layercast
             - name: shm
               mountPath: /dev/shm
           readinessProbe:
@@ -499,15 +315,10 @@ spec:
             timeoutSeconds: 5
 
       volumes:
-        - name: ipc-socket
-          emptyDir: {}
         - name: shm
           emptyDir:
             medium: Memory
             sizeLimit: 4Gi
-        - name: compile-cache
-          emptyDir:
-            sizeLimit: 10Gi
 
 ---
 # Services for inter-pod communication and init container health checks.
@@ -526,9 +337,6 @@ spec:
     - port: 8000
       targetPort: 8000
       name: http
-    - port: 7903
-      targetPort: 7903
-      name: nixl-control
 
 ---
 apiVersion: v1
@@ -546,9 +354,6 @@ spec:
     - port: 8000
       targetPort: 8000
       name: http
-    - port: 7903
-      targetPort: 7903
-      name: nixl-control
 
 ---
 apiVersion: v1
@@ -566,6 +371,3 @@ spec:
     - port: 8000
       targetPort: 8000
       name: http
-    - port: 7903
-      targetPort: 7903
-      name: nixl-control

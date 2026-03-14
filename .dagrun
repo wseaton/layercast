@@ -3,23 +3,23 @@
 # Personal/infra details live in .env.local (gitignored).
 # Source it before running:  set -a && source .env.local && set +a
 #
-# Usage: dagrun run model-mesh-build
+# Usage: dagrun run metadata-server-build
 
 # Sync source to remote (excludes target dir)
 sync:
     rsync -az --delete --exclude target --exclude .git -e ssh ${LOCAL_SRC} ${BUILD_HOST}:${BUILD_WORKDIR}/
 
-# Build model-mesh production image
+# Build metadata-server production image
 # /var/tmp is on root (70GB, tight); redirect podman temp to /home
 # @ssh ${BUILD_HOST} workdir=${BUILD_WORKDIR}
 # @timeout 20m
-model-mesh-build: sync
-    export TMPDIR=${PODMAN_TMPDIR} && podman build -f Containerfile.model-mesh -t ${REGISTRY}:${MESH_TAG} .
+metadata-server-build: sync
+    export TMPDIR=${PODMAN_TMPDIR} && podman build -f Containerfile.metadata-server -t ${REGISTRY}:${SERVER_TAG} .
 
-# Push model-mesh image to registry
+# Push metadata-server image to registry
 # @ssh ${BUILD_HOST}
-model-mesh-push: model-mesh-build
-    podman push ${REGISTRY}:${MESH_TAG}
+metadata-server-push: metadata-server-build
+    podman push ${REGISTRY}:${SERVER_TAG}
 
 # Build vLLM + layercast plugin test image (based on llm-d)
 # @ssh ${BUILD_HOST} workdir=${BUILD_WORKDIR}

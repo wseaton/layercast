@@ -1,3 +1,0 @@
-fn main() {
-    prost_build::compile_protos(&["../../proto/layercast.proto"], &["../../proto/"]).unwrap();
-}

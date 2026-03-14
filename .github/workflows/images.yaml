@@ -3,7 +3,7 @@ name: Container Images
 on:
   push:
     branches: [main]
-    tags: ["v*", "model-mesh-v*", "vllm-plugin-v*"]
+    tags: ["v*", "metadata-server-v*", "vllm-plugin-v*"]
 
 permissions:
   contents: read
@@ -23,7 +23,7 @@ jobs:
     name: Detect changes
     runs-on: ubuntu-latest
     outputs:
-      model-mesh: ${{ steps.filter.outputs.model-mesh }}
+      metadata-server: ${{ steps.filter.outputs.metadata-server }}
       vllm-plugin: ${{ steps.filter.outputs.vllm-plugin }}
     steps:
       - uses: actions/checkout@v4
@@ -32,21 +32,22 @@ jobs:
         # Tags always build everything; branch pushes use path filtering.
         with:
           filters: |
-            model-mesh:
+            metadata-server:
               - 'crates/**'
+              - 'proto/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
-              - 'Containerfile.model-mesh'
+              - 'Containerfile.metadata-server'
             vllm-plugin:
               - 'vllm-plugin/**'
               - 'Containerfile.vllm-plugin'
 
-  model-mesh:
-    name: Build model-mesh
+  metadata-server:
+    name: Build metadata-server
     needs: changes
     if: >-
       startsWith(github.ref, 'refs/tags/') ||
-      needs.changes.outputs.model-mesh == 'true'
+      needs.changes.outputs.metadata-server == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -61,19 +62,19 @@ jobs:
         with:
           images: ${{ env.IMAGE }}
           tags: |
-            type=sha,prefix=model-mesh-
-            type=ref,event=branch,prefix=model-mesh-
-            type=semver,pattern={{version}},prefix=model-mesh-v
-            type=semver,pattern={{major}}.{{minor}},prefix=model-mesh-v
+            type=sha,prefix=metadata-server-
+            type=ref,event=branch,prefix=metadata-server-
+            type=semver,pattern={{version}},prefix=metadata-server-v
+            type=semver,pattern={{major}}.{{minor}},prefix=metadata-server-v
       - uses: docker/build-push-action@v5
         with:
           context: .
-          file: Containerfile.model-mesh
+          file: Containerfile.metadata-server
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=model-mesh
-          cache-to: type=gha,mode=max,scope=model-mesh
+          cache-from: type=gha,scope=metadata-server
+          cache-to: type=gha,mode=max,scope=metadata-server
 
   vllm-plugin:
     name: Build vllm-plugin

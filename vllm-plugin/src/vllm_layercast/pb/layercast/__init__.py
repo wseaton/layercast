@@ -12,6 +12,46 @@ from typing import (
 import betterproto
 
 
+# ── gRPC wrapper messages (include pod identity) ──────────────────────
+
+
+@dataclass(eq=False, repr=False)
+class PrepareModelRequest(betterproto.Message):
+    pod_name: str = betterproto.string_field(1)
+    pod_ip: str = betterproto.string_field(2)
+    prepare: "PrepareModel" = betterproto.message_field(3)
+
+
+@dataclass(eq=False, repr=False)
+class PrepareModelResponse(betterproto.Message):
+    prepared: "Prepared" = betterproto.message_field(1)
+
+
+@dataclass(eq=False, repr=False)
+class ModelLoadedRequest(betterproto.Message):
+    pod_name: str = betterproto.string_field(1)
+    loaded: "ModelLoaded" = betterproto.message_field(2)
+
+
+@dataclass(eq=False, repr=False)
+class ModelLoadedResponse(betterproto.Message):
+    ok: "Ok" = betterproto.message_field(1)
+
+
+@dataclass(eq=False, repr=False)
+class ModelUnloadedRequest(betterproto.Message):
+    pod_name: str = betterproto.string_field(1)
+    unloaded: "ModelUnloaded" = betterproto.message_field(2)
+
+
+@dataclass(eq=False, repr=False)
+class ModelUnloadedResponse(betterproto.Message):
+    ok: "Ok" = betterproto.message_field(1)
+
+
+# ── IPC messages (used by both gRPC wrappers and legacy Unix socket) ──
+
+
 @dataclass(eq=False, repr=False)
 class IpcRequest(betterproto.Message):
     prepare_model: "PrepareModel" = betterproto.message_field(1, group="msg")
@@ -39,6 +79,9 @@ class ModelLoaded(betterproto.Message):
 @dataclass(eq=False, repr=False)
 class ModelUnloaded(betterproto.Message):
     agent_name: str = betterproto.string_field(1)
+
+
+# ── Responses (tagged union via oneof) ───────────────────────────────
 
 
 @dataclass(eq=False, repr=False)

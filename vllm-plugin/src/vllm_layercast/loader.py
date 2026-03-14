@@ -46,7 +46,7 @@ except ImportError:
 from huggingface_hub import try_to_load_from_cache  # noqa: E402
 from safetensors import safe_open  # noqa: E402
 
-from vllm_layercast.backend_rust import RustSidecarBackend  # noqa: E402
+from vllm_layercast.backend_rust import LayercastBackend  # noqa: E402
 from vllm_layercast.checksum import is_enabled as _checksum_enabled  # noqa: E402
 from vllm_layercast.checksum import verify_checksums  # noqa: E402
 from vllm_layercast.nixl_agent import VramNixlAgent, _COALESCE_THRESHOLD  # noqa: E402
@@ -60,10 +60,9 @@ _NIXL_AGENTS_LOCK = threading.Lock()
 
 # Keep the backend + event loop alive for the process lifetime.
 # Without this, Python GC collects the model loader after load_model()
-# returns, closing the Unix socket. The sidecar interprets the EOF as a
-# crash and auto-unadvertises, nuking the CRD entry before any consumer
-# can discover us.
-_BACKEND_KEEPALIVE: tuple[asyncio.AbstractEventLoop, RustSidecarBackend] | None = None
+# returns, closing the gRPC channel. The backend's heartbeat task
+# needs the channel alive to periodically re-register with the server.
+_BACKEND_KEEPALIVE: tuple[asyncio.AbstractEventLoop, LayercastBackend] | None = None
 
 
 class LayercastModelLoader(BaseModelLoader):
@@ -76,7 +75,7 @@ class LayercastModelLoader(BaseModelLoader):
         super().__init__(load_config)
         log.info("init", pid=os.getpid())
         self._nixl_agent: VramNixlAgent | None = None
-        self._backend: RustSidecarBackend | None = None
+        self._backend: LayercastBackend | None = None
         self._backend_loop: asyncio.AbstractEventLoop | None = None
         self._weight_files_cache: dict[str, list[str]] = {}
         self._weight_map: dict[str, str] = {}  # tensor name -> shard file
@@ -421,9 +420,8 @@ class LayercastModelLoader(BaseModelLoader):
     ) -> None:
         """Register loaded VRAM tensors with NIXL and publish metadata.
 
-        Sends the NIXL agent metadata and tensor address manifest as separate
-        protobuf fields to the daemon. The daemon stores them as a serialized
-        PeerNixlMd proto.
+        Sends the NIXL agent metadata and tensor address manifest via gRPC
+        to the central metadata server, which stores them for peer discovery.
 
         If tensors are already registered (e.g. from _try_nixl_load), we
         skip re-registration to avoid the ~5s cost.
@@ -487,8 +485,8 @@ class LayercastModelLoader(BaseModelLoader):
                 tensors=len(gpu_tensors),
                 rank=tp_rank,
             )
-            # Pin the backend + loop so GC can't close the IPC socket.
-            # The sidecar treats EOF as a crash and unadvertises immediately.
+            # Pin the backend + loop so GC can't close the gRPC channel.
+            # The heartbeat task needs the channel alive to re-register.
             global _BACKEND_KEEPALIVE  # noqa: PLW0603
             _BACKEND_KEEPALIVE = (loop, backend)
         except Exception as exc:
@@ -501,11 +499,11 @@ class LayercastModelLoader(BaseModelLoader):
     # Helpers
 
     def _get_backend_loop(self) -> asyncio.AbstractEventLoop:
-        """Get or create the dedicated event loop for backend IPC.
+        """Get or create the dedicated event loop for backend gRPC.
 
-        The DaemonClient's socket reader/writer are bound to a specific event
-        loop. vLLM may run its own event loop in the main thread later, so we
-        keep a dedicated loop to avoid "Future attached to a different loop".
+        The gRPC async channel is bound to a specific event loop. vLLM may
+        run its own event loop in the main thread later, so we keep a
+        dedicated loop to avoid "Future attached to a different loop".
         """
         if self._backend_loop is None or self._backend_loop.is_closed():
             self._backend_loop = asyncio.new_event_loop()
@@ -632,13 +630,13 @@ class LayercastModelLoader(BaseModelLoader):
                 self._nixl_agent = agent
         return self._nixl_agent
 
-    async def _get_backend(self) -> RustSidecarBackend:
+    async def _get_backend(self) -> LayercastBackend:
         """Lazily create and connect the backend."""
         if self._backend is None:
-            socket_path = os.environ.get(
-                "LAYERCAST_SOCKET", "/var/run/layercast/daemon.sock"
+            server_addr = os.environ.get(
+                "LAYERCAST_SERVER_ADDR", "layercast-metadata-server:50051"
             )
-            self._backend = RustSidecarBackend(socket_path=socket_path)
+            self._backend = LayercastBackend(server_addr=server_addr)
             await self._backend.start()
         return self._backend
 

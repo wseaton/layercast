@@ -1,0 +1,46 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: metadata-server
+  namespace: layercast
+  labels:
+    app.kubernetes.io/part-of: layercast
+    app: metadata-server
+---
+# Namespaced: ConfigMap persistence, Pod watching, Lease election
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: metadata-server
+  namespace: layercast
+  labels:
+    app.kubernetes.io/part-of: layercast
+rules:
+  # ConfigMap for state persistence
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "update", "patch"]
+  # Pod watcher for crash detection
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  # Lease-based leader election
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: metadata-server
+  namespace: layercast
+  labels:
+    app.kubernetes.io/part-of: layercast
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: metadata-server
+subjects:
+  - kind: ServiceAccount
+    name: metadata-server
+    namespace: layercast

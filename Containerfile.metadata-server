@@ -24,33 +24,34 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY proto/ proto/
 COPY crates/discovery/Cargo.toml crates/discovery/Cargo.toml
-COPY crates/model-mesh/Cargo.toml crates/model-mesh/Cargo.toml
+COPY crates/metadata-server/Cargo.toml crates/metadata-server/Cargo.toml
 
-COPY crates/model-mesh/build.rs crates/model-mesh/build.rs
+COPY crates/metadata-server/build.rs crates/metadata-server/build.rs
 
-RUN for crate in discovery model-mesh; do \
+RUN for crate in discovery metadata-server; do \
     mkdir -p crates/$crate/src && echo "" > crates/$crate/src/lib.rs; \
     done && \
-    echo "fn main() {}" > crates/model-mesh/src/main.rs
+    echo "fn main() {}" > crates/metadata-server/src/main.rs
 
 # Pre-fetch deps
-RUN cargo build -p model-mesh --release 2>/dev/null || true
+RUN cargo build -p metadata-server --release 2>/dev/null || true
 
 # Copy real source and build
 COPY crates/ crates/
 RUN touch crates/*/src/*.rs
-RUN cargo build -p model-mesh --release
+RUN cargo build -p metadata-server --release
 
 FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
 
-COPY --from=builder /build/target/release/model-mesh /usr/local/bin/model-mesh
+COPY --from=builder /build/target/release/metadata-server /usr/local/bin/metadata-server
 
-# Create IPC socket and compile cache directories (writable by non-root UID 2000)
-RUN mkdir -p /var/run/layercast /var/cache/layercast/compile-cache && \
-    chown -R 2000:0 /var/run/layercast /var/cache/layercast
+# Compile cache directory (writable by non-root UID 2000)
+RUN mkdir -p /var/cache/layercast/compile-cache && \
+    chown -R 2000:0 /var/cache/layercast
 
 USER 2000
 
-EXPOSE 8081
+# gRPC + HTTP health + RESP compile cache
+EXPOSE 50051 8081 6379
 
-ENTRYPOINT ["model-mesh"]
+ENTRYPOINT ["metadata-server"]

@@ -1,39 +1,38 @@
-"""Rust sidecar backend: delegates to the layercast daemon via Unix socket IPC."""
+"""Layercast backend: delegates to the central metadata server via gRPC."""
 
 from __future__ import annotations
 
-from vllm_layercast.daemon_client import DaemonClient
+from vllm_layercast.grpc_client import GrpcClient
 from vllm_layercast.log import get_logger
 from vllm_layercast.proto import Prepared, TensorInfo
 
-log = get_logger("vllm_layercast.backend_rust")
+log = get_logger("vllm_layercast.backend")
 
 
-class RustSidecarBackend:
-    """Backend that talks to the Rust model-mesh sidecar over Unix socket IPC.
+class LayercastBackend:
+    """Backend that talks to the layercast metadata server over gRPC.
 
-    Each backend instance maintains one persistent connection to the daemon.
-    The connection tracks state (Connected -> Preparing -> Ready) on the
-    daemon side, with automatic cleanup on disconnect (crash protection).
+    Each backend instance maintains one persistent gRPC channel. The server
+    tracks per-pod state machines with automatic cleanup via Pod watcher.
     """
 
-    def __init__(self, socket_path: str) -> None:
-        self._socket_path = socket_path
-        self._client: DaemonClient | None = None
+    def __init__(self, server_addr: str) -> None:
+        self._server_addr = server_addr
+        self._client: GrpcClient | None = None
 
     async def start(self) -> None:
-        self._client = DaemonClient(socket_path=self._socket_path)
+        self._client = GrpcClient(server_addr=self._server_addr)
         await self._client.connect()
-        log.info("started", socket=self._socket_path)
+        log.info("started", server=self._server_addr)
 
     async def stop(self) -> None:
         if self._client is not None:
             await self._client.close()
             self._client = None
 
-    def _ensure_client(self) -> DaemonClient:
-        if self._client is None or self._client._writer is None:
-            raise RuntimeError("RustSidecarBackend not connected. Call start() first.")
+    def _ensure_client(self) -> GrpcClient:
+        if self._client is None:
+            raise RuntimeError("LayercastBackend not connected. Call start() first.")
         return self._client
 
     async def prepare_model(
@@ -42,10 +41,7 @@ class RustSidecarBackend:
         revision: str,
         tp_rank: int,
     ) -> Prepared:
-        """Ask daemon to list files + discover NIXL peers.
-
-        Returns a Prepared message with files, peers, weight_map, and transfer_plan.
-        """
+        """Ask server to list files + discover NIXL peers."""
         client = self._ensure_client()
         return await client.prepare_model(model_id, revision, tp_rank)
 
@@ -71,3 +67,7 @@ class RustSidecarBackend:
     async def model_unloaded(self, agent_name: str) -> None:
         client = self._ensure_client()
         await client.model_unloaded(agent_name)
+
+
+# Keep the old name as an alias during migration
+RustSidecarBackend = LayercastBackend

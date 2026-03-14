@@ -47,9 +47,11 @@ def register() -> None:
 
     register_model_loader(_LOAD_FORMAT)(LayercastModelLoader)
 
-    socket_path = os.environ.get("LAYERCAST_SOCKET", "/var/run/layercast/daemon.sock")
+    server_addr = os.environ.get(
+        "LAYERCAST_SERVER_ADDR", "layercast-metadata-server:50051"
+    )
     log.info(
         "registered",
         load_format=_LOAD_FORMAT,
-        socket=socket_path,
+        server=server_addr,
     )

@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "crates/discovery",
-    "crates/model-mesh",
+    "crates/metadata-server",
 ]
 
 [workspace.dependencies]
