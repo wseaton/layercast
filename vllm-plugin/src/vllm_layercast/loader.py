@@ -50,6 +50,11 @@ from vllm_layercast.backend_rust import LayercastBackend  # noqa: E402
 from vllm_layercast.checksum import is_enabled as _checksum_enabled  # noqa: E402
 from vllm_layercast.checksum import verify_checksums  # noqa: E402
 from vllm_layercast.nixl_agent import VramNixlAgent, _COALESCE_THRESHOLD  # noqa: E402
+
+# When true, issue all peer RDMA transfers before waiting, overlapping
+# reads from multiple sources. Helps when peers are on separate NICs,
+# but can cause contention when sharing a single NIC/PCIe link.
+_PARALLEL_PEER_XFER = os.environ.get("LAYERCAST_PARALLEL_PEER_XFER", "0") == "1"
 from vllm_layercast.proto import PeerNixlMd, Prepared, TensorInfo  # noqa: E402
 
 # Keep NIXL agents alive for the process lifetime so remote peers can
@@ -377,9 +382,10 @@ class LayercastModelLoader(BaseModelLoader):
         local_handle, local_names = agent.register_and_prep_local(local_tensors)
         local_name_to_idx = {n: i for i, n in enumerate(local_names)}
 
-        # Prep and issue all peer transfers, then wait for all at once.
-        # Issuing before waiting overlaps RDMA from multiple peers for
-        # ~linear speedup (each peer saturates a different IB port).
+        # Issue transfers per peer. When parallel mode is enabled, all
+        # transfers are issued before waiting (overlaps RDMA from separate
+        # NICs). Default is sequential (issue + wait per peer) to avoid
+        # contention on shared NIC/PCIe links.
         all_failed: list[str] = []
         in_flight: list[tuple[str, list[str], object]] = []
         for assignment in plan:
@@ -418,17 +424,21 @@ class LayercastModelLoader(BaseModelLoader):
                     remote_handle,
                     range(len(remote_entries)),
                 )
-                in_flight.append((peer_name, remote_names, handle))
-            except RuntimeError as exc:
+                if _PARALLEL_PEER_XFER:
+                    in_flight.append((peer_name, remote_names, handle))
+                else:
+                    agent.wait_transfer(handle)
+            except (RuntimeError, TimeoutError) as exc:
                 log.warning(
-                    "nixl_peer_prep_failed",
+                    "nixl_peer_partial_failure",
                     peer=peer_name,
                     failed=len(remote_names),
+                    assigned=len(remote_names),
                     error=str(exc),
                 )
                 all_failed.extend(remote_names)
 
-        # Wait for all in-flight transfers to complete.
+        # Wait for any in-flight parallel transfers.
         for peer_name, remote_names, handle in in_flight:
             try:
                 agent.wait_transfer(handle)
