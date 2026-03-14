@@ -88,7 +88,10 @@ impl LayercastService for LayercastGrpcServer {
         let session = self.get_or_create_session(&req.pod_name, &req.pod_ip).await;
         let mut handler = session.lock().await;
 
-        match handler.handle_prepare(prepare).await {
+        let timeout_override = req
+            .peer_discovery_timeout_s
+            .map(|s| Duration::from_secs(s as u64));
+        match handler.handle_prepare(prepare, timeout_override).await {
             Ok(prepared) => Ok(Response::new(proto::PrepareModelResponse {
                 prepared: Some(prepared),
             })),

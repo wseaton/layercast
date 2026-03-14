@@ -349,16 +349,28 @@ class K8sRunner:
         self._stern_procs.clear()
 
     def scrape_compile_cache_stats(self) -> dict[str, int]:
-        """Fetch compile cache stats from the central metadata server."""
+        """Fetch compile cache stats via port-forward to the metadata server."""
+        import socket
+
+        # Find a free local port
+        with socket.socket() as s:
+            s.bind(("", 0))
+            local_port = s.getsockname()[1]
+
+        pf = subprocess.Popen(
+            [*self.kubectl, "port-forward", "svc/layercast-metadata-server",
+             f"{local_port}:8081"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
         try:
-            raw = _run([
-                *self.kubectl, "exec",
-                "deploy/layercast-metadata-server", "--",
-                "curl", "-sf", "http://127.0.0.1:8081/internal/compile-cache-stats",
-            ])
+            time.sleep(2)
+            raw = _run(["curl", "-sf", f"http://127.0.0.1:{local_port}/compile-cache-stats"])
             return json.loads(raw) if raw else {}
         except (SubprocessError, json.JSONDecodeError):
             return {}
+        finally:
+            pf.kill()
+            pf.wait()
 
     def apply_raw(self, path: str) -> None:
         try:
@@ -1034,7 +1046,7 @@ def main() -> None:
         k8s.delete_raw("job", "populate-model")
         k8s.apply_template(
             f"{deploy_dir}/populate-job.yaml",
-            model=cfg.model, vllm_image=cfg.vllm_image, ,
+            model=cfg.model, vllm_image=cfg.vllm_image,
         )
         info("Waiting for populate job...")
         if not k8s.wait_job("populate-model"):
@@ -1062,7 +1074,6 @@ def main() -> None:
         cluster=cfg.context,
         timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         vllm_image=cfg.vllm_image,
-        ,
         log_dir=str(log_dir),
         results=results,
     )

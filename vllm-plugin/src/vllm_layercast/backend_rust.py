@@ -40,10 +40,12 @@ class LayercastBackend:
         model_id: str,
         revision: str,
         tp_rank: int,
+        peer_discovery_timeout_s: int | None = None,
     ) -> Prepared:
-        """Ask server to list files + discover NIXL peers."""
         client = self._ensure_client()
-        return await client.prepare_model(model_id, revision, tp_rank)
+        return await client.prepare_model(
+            model_id, revision, tp_rank, peer_discovery_timeout_s
+        )
 
     async def model_loaded(
         self,

@@ -9,4 +9,4 @@ resources:
 images:
   - name: metadata-server
     newName: ghcr.io/wseaton/layercast
-    newTag: metadata-server-main
+    newTag: metadata-server-feat-central-metadata-server

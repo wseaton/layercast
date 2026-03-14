@@ -71,6 +71,7 @@ impl SessionHandler {
     pub async fn handle_prepare(
         &mut self,
         prepare: proto::PrepareModel,
+        timeout_override: Option<Duration>,
     ) -> Result<proto::Prepared, String> {
         match &self.state {
             SessionState::Connected => {}
@@ -101,7 +102,8 @@ impl SessionHandler {
             .await
             .map_err(|e| format!("failed to list model files: {e}"))?;
 
-        let peers = self.discover_peers(&model_id, tp_rank).await;
+        let timeout = timeout_override.unwrap_or(self.peer_discovery_timeout);
+        let peers = self.discover_peers(&model_id, tp_rank, timeout).await;
         let transfer_plan = transfer_plan::compute_transfer_plan(&peers);
 
         info!(
@@ -340,7 +342,12 @@ impl SessionHandler {
         }
     }
 
-    async fn discover_peers(&self, model_id: &str, tp_rank: u32) -> Vec<proto::PeerNixlMd> {
+    async fn discover_peers(
+        &self,
+        model_id: &str,
+        tp_rank: u32,
+        timeout: Duration,
+    ) -> Vec<proto::PeerNixlMd> {
         let start = tokio::time::Instant::now();
 
         let entries = loop {
@@ -348,9 +355,7 @@ impl SessionHandler {
             if !found.is_empty() {
                 break found;
             }
-            if self.peer_discovery_timeout.is_zero()
-                || start.elapsed() >= self.peer_discovery_timeout
-            {
+            if timeout.is_zero() || start.elapsed() >= timeout {
                 info!(
                     model_id,
                     tp_rank,
@@ -363,7 +368,7 @@ impl SessionHandler {
                 model_id,
                 tp_rank,
                 elapsed_s = start.elapsed().as_secs(),
-                timeout_s = self.peer_discovery_timeout.as_secs(),
+                timeout_s = timeout.as_secs(),
                 "no peers found yet, retrying in 5s"
             );
             tokio::time::sleep(PEER_POLL_INTERVAL).await;
@@ -429,11 +434,14 @@ mod tests {
 
         // PrepareModel
         let prepared = handler
-            .handle_prepare(proto::PrepareModel {
-                model_id: "test/model".into(),
-                revision: "main".into(),
-                tp_rank: 0,
-            })
+            .handle_prepare(
+                proto::PrepareModel {
+                    model_id: "test/model".into(),
+                    revision: "main".into(),
+                    tp_rank: 0,
+                },
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(prepared.files, vec!["shard.safetensors"]);
@@ -524,11 +532,14 @@ mod tests {
 
         // Load model A
         handler
-            .handle_prepare(proto::PrepareModel {
-                model_id: "model-a".into(),
-                revision: "main".into(),
-                tp_rank: 0,
-            })
+            .handle_prepare(
+                proto::PrepareModel {
+                    model_id: "model-a".into(),
+                    revision: "main".into(),
+                    tp_rank: 0,
+                },
+                None,
+            )
             .await
             .unwrap();
         handler
@@ -547,11 +558,14 @@ mod tests {
 
         // Hot-swap to model B
         handler
-            .handle_prepare(proto::PrepareModel {
-                model_id: "model-b".into(),
-                revision: "main".into(),
-                tp_rank: 0,
-            })
+            .handle_prepare(
+                proto::PrepareModel {
+                    model_id: "model-b".into(),
+                    revision: "main".into(),
+                    tp_rank: 0,
+                },
+                None,
+            )
             .await
             .unwrap();
 
@@ -574,11 +588,14 @@ mod tests {
         let mut handler = test_handler(Arc::clone(&state));
 
         handler
-            .handle_prepare(proto::PrepareModel {
-                model_id: "test/model".into(),
-                revision: "main".into(),
-                tp_rank: 0,
-            })
+            .handle_prepare(
+                proto::PrepareModel {
+                    model_id: "test/model".into(),
+                    revision: "main".into(),
+                    tp_rank: 0,
+                },
+                None,
+            )
             .await
             .unwrap();
         handler
@@ -637,11 +654,14 @@ mod tests {
         // A different pod's handler should discover the peer
         let mut handler = test_handler(Arc::clone(&state));
         let prepared = handler
-            .handle_prepare(proto::PrepareModel {
-                model_id: "test/model".into(),
-                revision: "main".into(),
-                tp_rank: 0,
-            })
+            .handle_prepare(
+                proto::PrepareModel {
+                    model_id: "test/model".into(),
+                    revision: "main".into(),
+                    tp_rank: 0,
+                },
+                None,
+            )
             .await
             .unwrap();
 

@@ -63,6 +63,8 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
+            - name: PEER_DISCOVERY_TIMEOUT
+              value: "0"
             - name: CUDA_VISIBLE_DEVICES
               value: "0"
             - name: FLASHINFER_WORKSPACE_DIR

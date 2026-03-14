@@ -517,11 +517,14 @@ class LayercastModelLoader(BaseModelLoader):
         Returns a Prepared proto with files, peers, weight_map, and transfer_plan.
         Returns None if the backend is unavailable.
         """
+        timeout_env = os.environ.get("PEER_DISCOVERY_TIMEOUT")
+        timeout_s: int | None = int(timeout_env) if timeout_env is not None else None
+
         loop = self._get_backend_loop()
         try:
             backend = loop.run_until_complete(self._get_backend())
             prepared = loop.run_until_complete(
-                backend.prepare_model(repo_id, revision, tp_rank)
+                backend.prepare_model(repo_id, revision, tp_rank, timeout_s)
             )
             if prepared.files:
                 log.info(

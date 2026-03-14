@@ -18,6 +18,9 @@ message PrepareModelRequest {
   string pod_name = 1;
   string pod_ip = 2;
   PrepareModel prepare = 3;
+  // Per-request peer discovery timeout in seconds.
+  // 0 = no waiting (seed pods). Unset = use server default.
+  optional uint32 peer_discovery_timeout_s = 4;
 }
 
 message PrepareModelResponse {

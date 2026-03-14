@@ -82,11 +82,13 @@ class GrpcClient:
         model_id: str,
         revision: str,
         tp_rank: int,
+        peer_discovery_timeout_s: int | None = None,
     ) -> Prepared:
         req = PrepareModelRequest(
             pod_name=self._pod_name,
             pod_ip=self._pod_ip,
             prepare=PrepareModel(model_id=model_id, revision=revision, tp_rank=tp_rank),
+            peer_discovery_timeout_s=peer_discovery_timeout_s,
         )
         resp_bytes = await self._call_with_retry(self._prepare_method, bytes(req))
         resp = PrepareModelResponse().parse(resp_bytes)
