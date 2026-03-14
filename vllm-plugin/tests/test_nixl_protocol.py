@@ -555,26 +555,47 @@ class TestRegisterLocalVram:
         # Two register_memory calls: one local, one for serving
         assert agent._agent.register_memory.call_count == 2
 
-    def test_local_vram_stores_desc_handle(self) -> None:
-        """Descriptor handle is stored for cleanup in close()."""
+    def test_local_vram_tracked_separately(self) -> None:
+        """Local-only descs go to _local_only_descs, not _registered_descs."""
         agent = self._make_agent()
         handle = MagicMock()
         agent._agent.register_memory.return_value = handle
 
         agent.register_local_vram({"w0": self._fake_tensor(0xA000, 4096)})
-        assert handle in agent._registered_descs
+        assert handle in agent._local_only_descs
+        assert handle not in agent._registered_descs
 
-    def test_close_deregisters_memory(self) -> None:
-        """close() should deregister all memory including local-only."""
+    def test_deregister_local_vram(self) -> None:
+        """deregister_local_vram cleans up receive-side registrations."""
         agent = self._make_agent()
-        reg_handle = MagicMock()
-        agent._agent.register_memory.return_value = reg_handle
+        local_handle = MagicMock()
+        serve_handle = MagicMock()
+        agent._agent.register_memory.side_effect = [local_handle, serve_handle]
 
+        agent.register_local_vram({"w0": self._fake_tensor(0xA000, 4096)})
         agent.register_vram({"w0": self._fake_tensor(0xA000, 4096)})
+
+        agent.deregister_local_vram()
+
+        agent._agent.deregister_memory.assert_called_once_with(local_handle)
+        assert agent._local_only_descs == []
+        # Serving registration untouched
+        assert serve_handle in agent._registered_descs
+
+    def test_close_deregisters_all_memory(self) -> None:
+        """close() should deregister both serving and local-only."""
+        agent = self._make_agent()
+        local_handle = MagicMock()
+        serve_handle = MagicMock()
+        agent._agent.register_memory.side_effect = [local_handle, serve_handle]
+
+        agent.register_local_vram({"w0": self._fake_tensor(0xA000, 4096)})
+        agent.register_vram({"w1": self._fake_tensor(0xB000, 4096)})
         agent.close()
 
-        agent._agent.deregister_memory.assert_called_once_with(reg_handle)
-        assert agent._registered_names == set()
+        assert agent._agent.deregister_memory.call_count == 2
+        agent._agent.deregister_memory.assert_any_call(serve_handle)
+        agent._agent.deregister_memory.assert_any_call(local_handle)
 
 
 # PeerTransferAssignment tests

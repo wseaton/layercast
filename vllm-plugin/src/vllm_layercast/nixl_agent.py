@@ -92,6 +92,7 @@ class VramNixlAgent:
         self._agent.create_backend("UCX", ucx_init)
         self._name = name
         self._registered_descs: list[object] = []
+        self._local_only_descs: list[object] = []
         self._registered_names: set[str] = set()
         self._weight_manifest: list[dict[str, int | str | None]] = []
         log.info("agent_ready", name=name)
@@ -151,10 +152,11 @@ class VramNixlAgent:
         """Register GPU tensors as local NIXL destinations only.
 
         Used by the receive path (_issue_and_wait_transfers) to register
-        destination buffers for inbound NIXL READs. Does NOT update
-        _registered_names or _weight_manifest, so a subsequent register_vram
-        call in _publish_vram will re-register these tensors for serving
-        with the correct manifest entries and metadata export.
+        destination buffers for inbound NIXL READs. Tracked separately from
+        serving registrations so they can be deregistered before exporting
+        metadata (NIXL's get_agent_metadata includes ALL registered memory,
+        and overlapping receive+serve registrations cause ERR_NOT_ALLOWED
+        when a third peer tries to load the metadata).
         """
         if not tensors:
             return
@@ -166,8 +168,23 @@ class VramNixlAgent:
             descs.append((addr, nbytes, device_id, name))
         log.info("registering_local_vram", count=len(descs))
         reg = self._agent.register_memory(descs, mem_type="VRAM")
-        self._registered_descs.append(reg)
+        self._local_only_descs.append(reg)
         log.info("local_vram_registered", count=len(descs))
+
+    def deregister_local_vram(self) -> None:
+        """Deregister receive-side VRAM so get_agent_metadata() is clean.
+
+        Must be called after transfers complete but before get_metadata(),
+        otherwise the metadata blob contains both receive-side and serve-side
+        registrations for the same memory, which NIXL rejects with
+        ERR_NOT_ALLOWED on the consuming peer.
+        """
+        for desc in self._local_only_descs:
+            self._agent.deregister_memory(desc)
+        count = len(self._local_only_descs)
+        self._local_only_descs.clear()
+        if count:
+            log.info("local_vram_deregistered", count=count)
 
     def get_metadata(self) -> bytes:
         """Export this agent's metadata for sharing with remote agents."""
@@ -289,12 +306,13 @@ class VramNixlAgent:
 
     def close(self) -> None:
         """Release all registered memory and clean up."""
-        for desc in self._registered_descs:
+        for desc in [*self._registered_descs, *self._local_only_descs]:
             try:
                 self._agent.deregister_memory(desc)
             except Exception as exc:
                 log.warning("deregister_memory_failed", error=str(exc))
         self._registered_descs.clear()
+        self._local_only_descs.clear()
         self._registered_names.clear()
         self._weight_manifest.clear()
         log.info("agent_closed", name=self._name)

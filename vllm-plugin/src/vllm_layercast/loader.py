@@ -192,6 +192,11 @@ class LayercastModelLoader(BaseModelLoader):
                 # Move computed buffers (e.g. rotary cos_sin_cache) from
                 # CPU to GPU. NIXL only transfers parameters, not buffers.
                 model = model.to(target_device)
+                # Deregister receive-side VRAM before publishing. NIXL's
+                # get_agent_metadata() includes ALL registered memory, and
+                # overlapping receive+serve registrations for the same
+                # addresses cause ERR_NOT_ALLOWED on consuming peers.
+                self._nixl_agent.deregister_local_vram()
                 self._publish_vram(model, repo_id, revision, weight_files, tp_rank)
                 return model
             # NIXL load failed after init. This is a fatal error since
