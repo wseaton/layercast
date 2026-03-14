@@ -952,7 +952,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Layercast model load benchmarks")
     p.add_argument("--model", default=os.environ.get("BENCH_MODEL", "Qwen/Qwen2.5-32B"))
     p.add_argument("--vllm-image", default=os.environ.get(
-        "VLLM_IMAGE", "ghcr.io/wseaton/layercast:vllm-plugin-main"))
+        "VLLM_IMAGE", "ghcr.io/wseaton/layercast:vllm-plugin-feat-central-metadata-server"))
     p.add_argument("--context", default=os.environ.get("KUBE_CONTEXT", "coreweave-waldorf"))
     p.add_argument("--namespace", default=os.environ.get("BENCH_NS", "layercast"))
     p.add_argument("--skip-hf", action="store_true")
