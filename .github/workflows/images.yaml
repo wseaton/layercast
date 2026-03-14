@@ -2,7 +2,7 @@ name: Container Images
 
 on:
   push:
-    branches: [main]
+    branches: [main, feat/central-metadata-server]
     tags: ["v*", "metadata-server-v*", "vllm-plugin-v*"]
 
 permissions:
