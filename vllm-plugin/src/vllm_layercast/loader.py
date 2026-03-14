@@ -345,10 +345,15 @@ class LayercastModelLoader(BaseModelLoader):
             peer_manifests[assignment.agent_name] = {
                 t.name: t for t in assignment.tensors
             }
+            # Log a sample address to verify per-peer manifests differ.
+            sample = assignment.tensors[0] if assignment.tensors else None
             log.info(
                 "nixl_peer_loaded",
                 peer=peer_names[assignment.agent_name],
                 assigned_tensors=len(assignment.assigned_tensors),
+                total_tensors=len(assignment.tensors),
+                sample_name=sample.name if sample else "",
+                sample_addr=hex(sample.addr) if sample else "",
             )
 
         # Use any peer's manifest for materialization (names/sizes are
@@ -386,6 +391,18 @@ class LayercastModelLoader(BaseModelLoader):
             scoped_manifest = {
                 n: peer_manifest[n] for n in peer_local if n in peer_manifest
             }
+            # Debug: log first address to verify per-peer manifests
+            first_key = next(iter(scoped_manifest), None)
+            if first_key:
+                s = scoped_manifest[first_key]
+                log.info(
+                    "nixl_peer_transfer_start",
+                    peer=peer_name,
+                    tensors=len(scoped_manifest),
+                    sample_name=first_key,
+                    sample_remote_addr=hex(s.addr),
+                    sample_local_addr=hex(peer_local[first_key].data_ptr()),
+                )
 
             failed = _issue_and_wait_transfers(
                 agent, peer_name, scoped_manifest, peer_local
