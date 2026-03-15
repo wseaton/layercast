@@ -243,19 +243,38 @@ class VramNixlAgent:
         Combines register_local_vram + prep for the two-phase transfer API.
         Returns (prepped_handle, ordered_names) so callers can map tensor
         names to descriptor indices for make_prepped_xfer.
+
+        Skips registration for tensors already registered via register_vram
+        (e.g. early pre-allocation). Only calls register_memory for truly
+        new tensors, saving ~6s of redundant RDMA pinning.
         """
-        reg_descs: list[tuple[int, int, int, str]] = []
+        new_descs: list[tuple[int, int, int, str]] = []
         prep_descs: list[tuple[int, int, int]] = []
         names: list[str] = []
         for name, tensor in tensors.items():
             desc = self._tensor_desc(tensor)
-            reg_descs.append((*desc, name))
             prep_descs.append(desc)
             names.append(name)
-        reg = self._agent.register_memory(reg_descs, mem_type="VRAM")
-        self._local_only_descs.append(reg)
+            if name not in self._registered_names:
+                new_descs.append((*desc, name))
+
+        if new_descs:
+            reg = self._agent.register_memory(new_descs, mem_type="VRAM")
+            self._local_only_descs.append(reg)
+            log.info(
+                "registered_and_prepped_local",
+                new=len(new_descs),
+                skipped=len(names) - len(new_descs),
+                count=len(names),
+            )
+        else:
+            log.info(
+                "prepped_local_only",
+                skipped=len(names),
+                count=len(names),
+            )
+
         handle = self._agent.prep_xfer_dlist("", prep_descs, mem_type="VRAM")
-        log.info("registered_and_prepped_local", count=len(names))
         return handle, names
 
     def prep_remote_descs(
