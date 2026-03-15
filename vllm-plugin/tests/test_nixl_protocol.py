@@ -598,11 +598,11 @@ class TestRegisterLocalVram:
         agent._agent.deregister_memory.assert_any_call(local_handle)
 
 
-# register_vram_early + finalize_manifest tests
+# register_vram(checksums=False) + finalize_manifest tests
 
 
 class TestRegisterVramEarly:
-    """Test the register-once optimization: register_vram_early + finalize_manifest."""
+    """Test the register-once optimization: register_vram(checksums=False) + finalize_manifest."""
 
     def _make_agent(self) -> "VramNixlAgent":
         import vllm_layercast.nixl_agent as mod
@@ -635,11 +635,11 @@ class TestRegisterVramEarly:
         return t
 
     def test_early_registration_populates_tracking(self) -> None:
-        """register_vram_early should populate _registered_names and _weight_manifest."""
+        """register_vram(checksums=False) should populate tracking with checksum=None."""
         agent = self._make_agent()
         agent._agent.register_memory.return_value = MagicMock()
 
-        agent.register_vram_early({"w0": self._fake_tensor(0xA000, 4096)})
+        agent.register_vram({"w0": self._fake_tensor(0xA000, 4096)}, checksums=False)
 
         assert "w0" in agent._registered_names
         assert len(agent._weight_manifest) == 1
@@ -647,11 +647,11 @@ class TestRegisterVramEarly:
         assert agent._weight_manifest[0]["addr"] == 0xA000
 
     def test_early_registration_prevents_double_register(self) -> None:
-        """After register_vram_early, register_vram should skip (dedup)."""
+        """After register_vram(checksums=False), register_vram should skip (dedup)."""
         agent = self._make_agent()
         agent._agent.register_memory.return_value = MagicMock()
 
-        agent.register_vram_early({"w0": self._fake_tensor(0xA000, 4096)})
+        agent.register_vram({"w0": self._fake_tensor(0xA000, 4096)}, checksums=False)
         agent.register_vram({"w0": self._fake_tensor(0xA000, 4096)})
 
         # Only one register_memory call (the early one)
@@ -672,7 +672,7 @@ class TestRegisterVramEarly:
         agent._agent.register_memory.return_value = MagicMock()
 
         t0 = self._fake_tensor(0xA000, 4096)
-        agent.register_vram_early({"w0": t0})
+        agent.register_vram({"w0": t0}, checksums=False)
         assert agent._weight_manifest[0]["checksum"] is None
 
         agent.finalize_manifest({"w0": t0})
@@ -689,20 +689,18 @@ class TestRegisterVramEarly:
         agent = self._make_agent()
         agent._agent.register_memory.return_value = MagicMock()
 
-        agent.register_vram_early({"w0": self._fake_tensor(0xA000, 4096)})
+        agent.register_vram({"w0": self._fake_tensor(0xA000, 4096)}, checksums=False)
         agent.finalize_manifest({"w0": self._fake_tensor(0xA000, 4096)})
         assert agent._weight_manifest[0]["checksum"] is None
 
     def test_early_plus_local_only_coalesced(self) -> None:
-        """register_vram_early for tensors + register_local_vram for coalesced buf."""
+        """register_vram(checksums=False) for tensors + register_local_vram for coalesced buf."""
         agent = self._make_agent()
         early_handle = MagicMock()
         local_handle = MagicMock()
         agent._agent.register_memory.side_effect = [early_handle, local_handle]
 
-        # Register all tensors serve-side upfront
-        agent.register_vram_early({"w0": self._fake_tensor(0xA000, 4096)})
-        # Register coalesced buffer local-only
+        agent.register_vram({"w0": self._fake_tensor(0xA000, 4096)}, checksums=False)
         agent.register_local_vram({"__coalesced__": self._fake_tensor(0xC000, 8192)})
 
         assert early_handle in agent._registered_descs

@@ -170,11 +170,7 @@ class LayercastModelLoader(BaseModelLoader):
             weight_files = self._get_weight_files(model_config)
 
         if peers:
-            # Overlap agent init + VRAM pre-allocation + registration (~8s)
-            # with model init (~16s). The agent initializes UCX backends,
-            # then we pre-allocate CUDA tensors from the remote manifest and
-            # register them with NIXL. All of this runs in a background thread
-            # while initialize_model builds the computation graph on meta device.
+            # Overlap NIXL setup with model init in a background thread.
             peer = peers[0]
             remote_manifest = {t.name: t for t in peer.tensors}
 
@@ -183,7 +179,7 @@ class LayercastModelLoader(BaseModelLoader):
                     agent = self._ensure_nixl_agent(tp_rank)
                     pre_alloc = _pre_allocate_from_manifest(remote_manifest)
                     if pre_alloc:
-                        agent.register_vram_early(pre_alloc)
+                        agent.register_vram(pre_alloc, checksums=False)
                     return pre_alloc
                 except Exception as exc:
                     log.error("nixl_pre_register_failed", error=str(exc))
@@ -204,8 +200,6 @@ class LayercastModelLoader(BaseModelLoader):
                     "NIXL agent failed to initialize, cannot proceed with GPUDirect load"
                 )
 
-            # Bind pre-allocated CUDA tensors to model params so transfers
-            # write directly into the model's weight storage.
             if pre_allocated:
                 _bind_pre_allocated(model, pre_allocated, remote_manifest)
 
@@ -226,11 +220,7 @@ class LayercastModelLoader(BaseModelLoader):
                 # Move computed buffers (e.g. rotary cos_sin_cache) from
                 # CPU to GPU. NIXL only transfers parameters, not buffers.
                 model = model.to(target_device)
-                # Deregister only the coalesced receive buffer (if any).
-                # Large tensors were registered as serve-side upfront via
-                # register_vram_early, so no deregister + re-register needed.
                 self._nixl_agent.deregister_local_vram()
-                # Finalize checksums now that data has arrived, then publish.
                 self._nixl_agent.finalize_manifest(
                     {n: p.data for n, p in model.named_parameters() if p.is_cuda}
                 )
@@ -322,11 +312,7 @@ class LayercastModelLoader(BaseModelLoader):
             remote=len(remote_manifest),
         )
 
-        # Register ALL tensors as serve-side upfront. NIXL register_memory
-        # just pins GPU pages with the RDMA NIC, it works for both receiving
-        # and serving. This eliminates the separate receive-side registration
-        # (~5.3s for 258 large tensors) by reusing the same registration.
-        agent.register_vram_early(local_tensors)
+        agent.register_vram(local_tensors, checksums=False)
 
         failed = _issue_and_wait_transfers(
             agent,
@@ -524,14 +510,7 @@ class LayercastModelLoader(BaseModelLoader):
         weight_files: list[str],
         tp_rank: int,
     ) -> None:
-        """Register loaded VRAM tensors with NIXL and publish metadata.
-
-        Sends the NIXL agent metadata and tensor address manifest via gRPC
-        to the central metadata server, which stores them for peer discovery.
-
-        If tensors are already registered (e.g. from _try_nixl_load), we
-        skip re-registration to avoid the ~5s cost.
-        """
+        """Register VRAM tensors with NIXL and publish metadata to the server."""
         try:
             agent = self._ensure_nixl_agent(tp_rank)
         except Exception as exc:
@@ -753,14 +732,10 @@ class LayercastModelLoader(BaseModelLoader):
 def _pre_allocate_from_manifest(
     remote_manifest: dict[str, TensorInfo],
 ) -> dict[str, "torch.Tensor"]:
-    """Pre-allocate CUDA tensors from the remote manifest before model init.
+    """Pre-allocate flat CUDA tensors matching remote sizes/dtypes.
 
-    Allocates flat byte tensors with the right size and dtype for each
-    remote tensor. These can be registered with NIXL immediately (only
-    needs addr + size), then reshaped to match model param shapes later
-    via _bind_pre_allocated.
-
-    This runs in a background thread overlapped with initialize_model.
+    Allocated tensors can be NIXL-registered immediately, then reshaped
+    to match model param shapes via _bind_pre_allocated after model init.
     """
     device = f"cuda:{torch.cuda.current_device()}"
     tensors: dict[str, torch.Tensor] = {}
@@ -778,22 +753,13 @@ def _bind_pre_allocated(
     pre_allocated: dict[str, "torch.Tensor"],
     remote_manifest: dict[str, TensorInfo],
 ) -> None:
-    """Bind pre-allocated CUDA tensors to model params.
-
-    Reshapes flat pre-allocated tensors to match model parameter shapes
-    and assigns them as param.data. This makes RDMA transfers write
-    directly into model weight storage at the addresses NIXL registered.
-    """
+    """Reshape flat pre-allocated tensors to match model params and bind them."""
     bound = 0
     for name, param in model.named_parameters():
         if name not in pre_allocated:
             continue
-        flat = pre_allocated[name]
-        # Reshape the flat tensor to match param shape. This is a view
-        # (same underlying CUDA memory, same address NIXL registered).
-        shaped = flat.reshape(param.shape)
+        shaped = pre_allocated[name].reshape(param.shape)
         param.data = shaped
-        # Update the dict so downstream code sees the shaped version
         pre_allocated[name] = shaped
         bound += 1
     log.info(
@@ -814,8 +780,7 @@ def _materialize_params(
 ) -> dict[str, "torch.Tensor"]:
     """Materialize meta-device params to CUDA, matching remote manifest dtypes.
 
-    If params are already on CUDA (e.g. bound via _bind_pre_allocated),
-    returns them as-is without re-allocating.
+    Params already on CUDA (from _bind_pre_allocated) are returned as-is.
     """
     device = f"cuda:{torch.cuda.current_device()}"
     local_tensors: dict[str, torch.Tensor] = {}
@@ -845,11 +810,7 @@ def _issue_and_wait_transfers(
     """Issue NIXL reads and wait for completion. Returns names of failed tensors.
 
     Splits tensors into large (individual) and small (coalesced) transfers.
-    On failure, collects the tensor names that failed rather than aborting.
-
-    When skip_large_registration is True, large tensors are assumed to be
-    already registered with NIXL (e.g. via register_vram_early). Only the
-    coalesced buffer for small tensors needs local-only registration.
+    When skip_large_registration is True, large tensors are already registered.
     """
     device = f"cuda:{torch.cuda.current_device()}"
     large_tensors: dict[str, torch.Tensor] = {}

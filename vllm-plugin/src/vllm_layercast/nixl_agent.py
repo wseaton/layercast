@@ -111,12 +111,17 @@ class VramNixlAgent:
             tensor.device.index if tensor.device.index is not None else 0,
         )
 
-    def register_vram(self, tensors: dict[str, "torch.Tensor"]) -> None:
+    def register_vram(
+        self, tensors: dict[str, "torch.Tensor"], *, checksums: bool = True
+    ) -> None:
         """Register GPU tensors with NIXL for RDMA transfers.
 
-        Each tensor is registered as a VRAM segment so remote agents can
-        read directly from this GPU's memory. Also saves the address manifest
-        for sharing with peers so they know where to read from.
+        Pins GPU pages with the RDMA NIC so remote agents can read from
+        (or write to) this GPU's memory. Builds a manifest for peer discovery.
+
+        Pass checksums=False when tensors are allocated but not yet filled
+        (e.g. before RDMA transfer). Call finalize_manifest() after data
+        arrives to backfill checksums.
         """
         if not tensors:
             return
@@ -130,13 +135,13 @@ class VramNixlAgent:
             )
             return
 
-        checksums_enabled = _checksum_enabled()
+        compute = checksums and _checksum_enabled()
         descs: list[tuple[int, int, int, str]] = []
         manifest: list[dict[str, int | str | None]] = []
         for param_name, tensor in new_tensors.items():
             addr, nbytes, device_id = self._tensor_desc(tensor)
             descs.append((addr, nbytes, device_id, param_name))
-            checksum = tensor_wyhash(tensor) if checksums_enabled else None
+            checksum = tensor_wyhash(tensor) if compute else None
             manifest.append(
                 {
                     "name": param_name,
@@ -156,72 +161,16 @@ class VramNixlAgent:
         self._weight_manifest.extend(manifest)
         log.info("vram_registered", count=len(descs))
 
-    def register_vram_early(self, tensors: dict[str, "torch.Tensor"]) -> None:
-        """Register GPU tensors with NIXL before data arrives.
-
-        Like register_vram but skips checksum computation. Used when tensors
-        are allocated but not yet filled (e.g. before RDMA transfer). The
-        manifest is built with checksum=None; call finalize_manifest() after
-        data arrives to fill in checksums.
-
-        This lets us register VRAM once for both receiving transfers AND
-        serving to peers, eliminating the receive-side register + deregister
-        cycle (~5s saved on 258 tensors).
-        """
-        if not tensors:
-            return
-
-        new_tensors = {
-            name: t for name, t in tensors.items() if name not in self._registered_names
-        }
-        if not new_tensors:
-            log.debug(
-                "register_vram_early_skipped",
-                count=len(tensors),
-                reason="already_registered",
-            )
-            return
-
-        descs: list[tuple[int, int, int, str]] = []
-        manifest: list[dict[str, int | str | None]] = []
-        for param_name, tensor in new_tensors.items():
-            addr, nbytes, device_id = self._tensor_desc(tensor)
-            descs.append((addr, nbytes, device_id, param_name))
-            manifest.append(
-                {
-                    "name": param_name,
-                    "addr": addr,
-                    "size": nbytes,
-                    "device_id": device_id,
-                    "dtype": str(tensor.dtype),
-                    "checksum": None,
-                }
-            )
-
-        already = len(tensors) - len(new_tensors)
-        log.info("registering_vram", new=len(descs), already_registered=already)
-        reg = self._agent.register_memory(descs, mem_type="VRAM")
-        self._registered_descs.append(reg)
-        self._registered_names.update(new_tensors.keys())
-        self._weight_manifest.extend(manifest)
-        log.info("vram_registered", count=len(descs))
-
     def finalize_manifest(self, tensors: dict[str, "torch.Tensor"]) -> None:
-        """Fill in checksums for tensors registered via register_vram_early.
-
-        Call after data has been written to the tensors (e.g. after RDMA
-        transfer completes). Only computes checksums if enabled.
-        """
+        """Backfill checksums for tensors registered with checksums=False."""
         if not _checksum_enabled():
             return
 
-        name_to_tensor = tensors
         updated = 0
         for entry in self._weight_manifest:
-            name = entry["name"]
             if entry["checksum"] is not None:
                 continue
-            tensor = name_to_tensor.get(str(name))
+            tensor = tensors.get(str(entry["name"]))
             if tensor is not None:
                 entry["checksum"] = tensor_wyhash(tensor)
                 updated += 1
