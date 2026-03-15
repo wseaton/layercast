@@ -170,22 +170,45 @@ class LayercastModelLoader(BaseModelLoader):
             weight_files = self._get_weight_files(model_config)
 
         if peers:
-            # Overlap NIXL agent + UCX backend init (~3s) with model init (~16s).
-            # Both are independent: model init builds the graph on meta device,
-            # while NIXL creates UCX workers and endpoints.
-            with concurrent.futures.ThreadPoolExecutor(1) as executor:
-                agent_future = executor.submit(self._ensure_nixl_agent, tp_rank)
-                model = initialize_model(vllm_config, prefix=prefix)
-                # Collect the agent (will be instant if model init took longer)
+            # Overlap agent init + VRAM pre-allocation + registration (~8s)
+            # with model init (~16s). The agent initializes UCX backends,
+            # then we pre-allocate CUDA tensors from the remote manifest and
+            # register them with NIXL. All of this runs in a background thread
+            # while initialize_model builds the computation graph on meta device.
+            peer = peers[0]
+            remote_manifest = {t.name: t for t in peer.tensors}
+
+            def _init_agent_and_register() -> dict[str, torch.Tensor] | None:
                 try:
-                    agent_future.result(timeout=30)
+                    agent = self._ensure_nixl_agent(tp_rank)
+                    pre_alloc = _pre_allocate_from_manifest(remote_manifest)
+                    if pre_alloc:
+                        agent.register_vram_early(pre_alloc)
+                    return pre_alloc
+                except Exception as exc:
+                    log.error("nixl_pre_register_failed", error=str(exc))
+                    return None
+
+            with concurrent.futures.ThreadPoolExecutor(1) as executor:
+                reg_future = executor.submit(_init_agent_and_register)
+                model = initialize_model(vllm_config, prefix=prefix)
+                try:
+                    pre_allocated = reg_future.result(timeout=60)
                 except Exception as exc:
                     log.error("nixl_agent_init_failed", error=str(exc))
+                    pre_allocated = None
+
             if self._nixl_agent is None:
                 log.error("nixl_agent_not_initialized_after_init")
                 raise RuntimeError(
                     "NIXL agent failed to initialize, cannot proceed with GPUDirect load"
                 )
+
+            # Bind pre-allocated CUDA tensors to model params so transfers
+            # write directly into the model's weight storage.
+            if pre_allocated:
+                _bind_pre_allocated(model, pre_allocated, remote_manifest)
+
             if self._try_nixl_load(
                 model,
                 repo_id,
@@ -727,15 +750,81 @@ class LayercastModelLoader(BaseModelLoader):
         return self._backend
 
 
+def _pre_allocate_from_manifest(
+    remote_manifest: dict[str, TensorInfo],
+) -> dict[str, "torch.Tensor"]:
+    """Pre-allocate CUDA tensors from the remote manifest before model init.
+
+    Allocates flat byte tensors with the right size and dtype for each
+    remote tensor. These can be registered with NIXL immediately (only
+    needs addr + size), then reshaped to match model param shapes later
+    via _bind_pre_allocated.
+
+    This runs in a background thread overlapped with initialize_model.
+    """
+    device = f"cuda:{torch.cuda.current_device()}"
+    tensors: dict[str, torch.Tensor] = {}
+    for name, info in remote_manifest.items():
+        dtype = _parse_torch_dtype(info.dtype or None, torch.bfloat16)
+        elem_size = _dtype_element_size(dtype)
+        n_elements = info.size // elem_size
+        tensors[name] = torch.empty(n_elements, dtype=dtype, device=device)
+    log.info("pre_allocated_from_manifest", count=len(tensors))
+    return tensors
+
+
+def _bind_pre_allocated(
+    model: nn.Module,
+    pre_allocated: dict[str, "torch.Tensor"],
+    remote_manifest: dict[str, TensorInfo],
+) -> None:
+    """Bind pre-allocated CUDA tensors to model params.
+
+    Reshapes flat pre-allocated tensors to match model parameter shapes
+    and assigns them as param.data. This makes RDMA transfers write
+    directly into model weight storage at the addresses NIXL registered.
+    """
+    bound = 0
+    for name, param in model.named_parameters():
+        if name not in pre_allocated:
+            continue
+        flat = pre_allocated[name]
+        # Reshape the flat tensor to match param shape. This is a view
+        # (same underlying CUDA memory, same address NIXL registered).
+        shaped = flat.reshape(param.shape)
+        param.data = shaped
+        # Update the dict so downstream code sees the shaped version
+        pre_allocated[name] = shaped
+        bound += 1
+    log.info(
+        "pre_allocated_bound",
+        bound=bound,
+        model_params=sum(1 for _ in model.named_parameters()),
+    )
+
+
+def _dtype_element_size(dtype: "torch.dtype") -> int:
+    """Return element size in bytes for a torch dtype."""
+    return torch.tensor([], dtype=dtype).element_size()
+
+
 def _materialize_params(
     model: nn.Module,
     remote_manifest: dict[str, TensorInfo],
 ) -> dict[str, "torch.Tensor"]:
-    """Materialize meta-device params to CUDA, matching remote manifest dtypes."""
+    """Materialize meta-device params to CUDA, matching remote manifest dtypes.
+
+    If params are already on CUDA (e.g. bound via _bind_pre_allocated),
+    returns them as-is without re-allocating.
+    """
     device = f"cuda:{torch.cuda.current_device()}"
     local_tensors: dict[str, torch.Tensor] = {}
     for name, param in model.named_parameters():
         if name not in remote_manifest:
+            continue
+        if param.is_cuda:
+            # Already materialized (e.g. by _bind_pre_allocated)
+            local_tensors[name] = param.data
             continue
         remote_info = remote_manifest[name]
         dtype = _parse_torch_dtype(remote_info.dtype or None, param.dtype)
