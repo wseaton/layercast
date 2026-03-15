@@ -51,10 +51,10 @@ from vllm_layercast.checksum import is_enabled as _checksum_enabled  # noqa: E40
 from vllm_layercast.checksum import verify_checksums  # noqa: E402
 from vllm_layercast.nixl_agent import VramNixlAgent, _COALESCE_THRESHOLD  # noqa: E402
 
-# When true, issue all peer RDMA transfers before waiting, overlapping
-# reads from multiple sources. Helps when peers are on separate NICs,
-# but can cause contention when sharing a single NIC/PCIe link.
-_PARALLEL_PEER_XFER = os.environ.get("LAYERCAST_PARALLEL_PEER_XFER", "0") == "1"
+# Issue all peer RDMA transfers before waiting, overlapping reads from
+# multiple sources. Set to "0" to serialize transfers (useful if all
+# peers share a single NIC/PCIe link and contention hurts throughput).
+_PARALLEL_PEER_XFER = os.environ.get("LAYERCAST_PARALLEL_PEER_XFER", "1") != "0"
 from vllm_layercast.proto import PeerNixlMd, Prepared, TensorInfo  # noqa: E402
 
 # Keep NIXL agents alive for the process lifetime so remote peers can
