@@ -37,6 +37,15 @@ spec:
         bench/scenario: scale-seed
         layercast.io/managed: "true"
     spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values: ["bench"]
+              topologyKey: kubernetes.io/hostname
       containers:
         - name: vllm
           image: vllm-plugin:latest
@@ -132,6 +141,15 @@ spec:
         bench/scenario: scale-c1
         layercast.io/managed: "true"
     spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values: ["bench"]
+              topologyKey: kubernetes.io/hostname
       initContainers:
         - name: wait-for-seed
           image: curlimages/curl:latest
@@ -238,6 +256,15 @@ spec:
         bench/scenario: scale-c2
         layercast.io/managed: "true"
     spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values: ["bench"]
+              topologyKey: kubernetes.io/hostname
       initContainers:
         - name: wait-for-c1
           image: curlimages/curl:latest
@@ -277,6 +304,8 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
+            - name: LAYERCAST_PARALLEL_PEER_XFER
+              value: "1"
             - name: CUDA_VISIBLE_DEVICES
               value: "0"
             - name: FLASHINFER_WORKSPACE_DIR
