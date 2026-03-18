@@ -7,9 +7,47 @@ from dataclasses import dataclass
 from typing import (
     Dict,
     List,
+    Optional,
 )
 
 import betterproto
+
+
+@dataclass(eq=False, repr=False)
+class PrepareModelRequest(betterproto.Message):
+    pod_name: str = betterproto.string_field(1)
+    pod_ip: str = betterproto.string_field(2)
+    prepare: "PrepareModel" = betterproto.message_field(3)
+    peer_discovery_timeout_s: Optional[int] = betterproto.uint32_field(
+        4, optional=True, group="_peer_discovery_timeout_s"
+    )
+
+
+@dataclass(eq=False, repr=False)
+class PrepareModelResponse(betterproto.Message):
+    prepared: "Prepared" = betterproto.message_field(1)
+
+
+@dataclass(eq=False, repr=False)
+class ModelLoadedRequest(betterproto.Message):
+    pod_name: str = betterproto.string_field(1)
+    loaded: "ModelLoaded" = betterproto.message_field(2)
+
+
+@dataclass(eq=False, repr=False)
+class ModelLoadedResponse(betterproto.Message):
+    ok: "Ok" = betterproto.message_field(1)
+
+
+@dataclass(eq=False, repr=False)
+class ModelUnloadedRequest(betterproto.Message):
+    pod_name: str = betterproto.string_field(1)
+    unloaded: "ModelUnloaded" = betterproto.message_field(2)
+
+
+@dataclass(eq=False, repr=False)
+class ModelUnloadedResponse(betterproto.Message):
+    ok: "Ok" = betterproto.message_field(1)
 
 
 @dataclass(eq=False, repr=False)

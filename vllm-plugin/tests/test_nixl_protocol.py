@@ -1,8 +1,7 @@
 """Tests for the NIXL protobuf protocol.
 
-These tests verify the wire format and round-trip behavior WITHOUT
-requiring vLLM, NIXL, PyTorch, or real GPUs. All external deps are
-either mocked or not needed.
+Wire format and proto round-trip tests run everywhere.
+Tests that touch VramNixlAgent require nixl + torch (skipped in CI).
 """
 
 from __future__ import annotations
@@ -32,8 +31,17 @@ from vllm_layercast.proto import (
     encode,
 )
 
+try:
+    import torch  # noqa: F401
+    import vllm_layercast.nixl_agent as _nixl_mod  # noqa: F401
 
-# PeerNixlMd tests (structured proto, replaces compound msgpack)
+    _HAS_GPU_DEPS = True
+except Exception:
+    _HAS_GPU_DEPS = False
+
+requires_gpu_deps = pytest.mark.skipif(
+    not _HAS_GPU_DEPS, reason="gpu deps not installed"
+)
 
 
 class TestPeerNixlMd:
@@ -116,9 +124,6 @@ class TestPeerNixlMd:
         assert remote_manifest["embed.weight"].addr == 100
         assert remote_manifest["embed.weight"].size == 1000
         assert remote_manifest["lm_head.weight"].device_id == 1
-
-
-# IPC wire format tests (state machine messages)
 
 
 class TestIpcWireFormat:
@@ -430,6 +435,7 @@ class TestTensorInfo:
 # wait_transfer tests
 
 
+@requires_gpu_deps
 class TestWaitTransfer:
     """Test VramNixlAgent.wait_transfer polling, error detection, and timeout."""
 
@@ -482,6 +488,233 @@ class TestWaitTransfer:
         agent._agent.check_xfer_state.return_value = "PROC"
         with pytest.raises(TimeoutError, match="did not complete"):
             agent.wait_transfer("h")
+
+
+# register_local_vram tests
+
+
+@requires_gpu_deps
+class TestRegisterLocalVram:
+    """Test VramNixlAgent.register_local_vram for receive-side registration.
+
+    The receive path needs NIXL memory registration for destination buffers,
+    but must NOT pollute _registered_names or _weight_manifest. Otherwise
+    the subsequent _publish_vram call skips re-registration (dedup), and
+    the metadata blob advertised to peers lacks proper serving registrations.
+    """
+
+    def _make_agent(self) -> "VramNixlAgent":
+        import vllm_layercast.nixl_agent as mod
+
+        orig_agent = mod._nixl_agent
+        orig_config = mod._nixl_agent_config
+
+        mock_nixl = MagicMock()
+        mock_config_cls = MagicMock()
+        mod._nixl_agent = mock_nixl
+        mod._nixl_agent_config = mock_config_cls
+
+        try:
+            from vllm_layercast.nixl_agent import VramNixlAgent
+
+            agent = VramNixlAgent("test-agent")
+        finally:
+            mod._nixl_agent = orig_agent
+            mod._nixl_agent_config = orig_config
+
+        return agent
+
+    def _fake_tensor(self, addr: int, nbytes: int, device: int = 0) -> MagicMock:
+        t = MagicMock()
+        t.data_ptr.return_value = addr
+        t.nelement.return_value = nbytes
+        t.element_size.return_value = 1
+        t.device.index = device
+        t.dtype = "torch.bfloat16"
+        return t
+
+    def test_local_vram_does_not_pollute_tracking(self) -> None:
+        """register_local_vram must not touch _registered_names or _weight_manifest."""
+        agent = self._make_agent()
+        agent._agent.register_memory.return_value = MagicMock()
+
+        agent.register_local_vram({"w0": self._fake_tensor(0xA000, 4096)})
+
+        assert "w0" not in agent._registered_names
+        assert agent._weight_manifest == []
+        # But NIXL registration DID happen
+        agent._agent.register_memory.assert_called_once()
+
+    def test_local_vram_allows_subsequent_register_vram(self) -> None:
+        """After register_local_vram, register_vram should still register the same names."""
+        agent = self._make_agent()
+        agent._agent.register_memory.return_value = MagicMock()
+
+        # Receive path: local-only registration
+        agent.register_local_vram({"w0": self._fake_tensor(0xA000, 4096)})
+
+        # Publish path: full registration with manifest
+        agent.register_vram({"w0": self._fake_tensor(0xA000, 4096)})
+
+        assert "w0" in agent._registered_names
+        assert len(agent._weight_manifest) == 1
+        assert agent._weight_manifest[0]["addr"] == 0xA000
+        # Two register_memory calls: one local, one for serving
+        assert agent._agent.register_memory.call_count == 2
+
+    def test_local_vram_tracked_separately(self) -> None:
+        """Local-only descs go to _local_only_descs, not _registered_descs."""
+        agent = self._make_agent()
+        handle = MagicMock()
+        agent._agent.register_memory.return_value = handle
+
+        agent.register_local_vram({"w0": self._fake_tensor(0xA000, 4096)})
+        assert handle in agent._local_only_descs
+        assert handle not in agent._registered_descs
+
+    def test_deregister_local_vram(self) -> None:
+        """deregister_local_vram cleans up receive-side registrations."""
+        agent = self._make_agent()
+        local_handle = MagicMock()
+        serve_handle = MagicMock()
+        agent._agent.register_memory.side_effect = [local_handle, serve_handle]
+
+        agent.register_local_vram({"w0": self._fake_tensor(0xA000, 4096)})
+        agent.register_vram({"w0": self._fake_tensor(0xA000, 4096)})
+
+        agent.deregister_local_vram()
+
+        agent._agent.deregister_memory.assert_called_once_with(local_handle)
+        assert agent._local_only_descs == []
+        # Serving registration untouched
+        assert serve_handle in agent._registered_descs
+
+    def test_close_deregisters_all_memory(self) -> None:
+        """close() should deregister both serving and local-only."""
+        agent = self._make_agent()
+        local_handle = MagicMock()
+        serve_handle = MagicMock()
+        agent._agent.register_memory.side_effect = [local_handle, serve_handle]
+
+        agent.register_local_vram({"w0": self._fake_tensor(0xA000, 4096)})
+        agent.register_vram({"w1": self._fake_tensor(0xB000, 4096)})
+        agent.close()
+
+        assert agent._agent.deregister_memory.call_count == 2
+        agent._agent.deregister_memory.assert_any_call(serve_handle)
+        agent._agent.deregister_memory.assert_any_call(local_handle)
+
+
+# register_vram(checksums=False) + finalize_manifest tests
+
+
+@requires_gpu_deps
+class TestRegisterVramEarly:
+    """Test the register-once optimization: register_vram(checksums=False) + finalize_manifest."""
+
+    def _make_agent(self) -> "VramNixlAgent":
+        import vllm_layercast.nixl_agent as mod
+
+        orig_agent = mod._nixl_agent
+        orig_config = mod._nixl_agent_config
+
+        mock_nixl = MagicMock()
+        mock_config_cls = MagicMock()
+        mod._nixl_agent = mock_nixl
+        mod._nixl_agent_config = mock_config_cls
+
+        try:
+            from vllm_layercast.nixl_agent import VramNixlAgent
+
+            agent = VramNixlAgent("test-agent")
+        finally:
+            mod._nixl_agent = orig_agent
+            mod._nixl_agent_config = orig_config
+
+        return agent
+
+    def _fake_tensor(self, addr: int, nbytes: int, device: int = 0) -> MagicMock:
+        t = MagicMock()
+        t.data_ptr.return_value = addr
+        t.nelement.return_value = nbytes
+        t.element_size.return_value = 1
+        t.device.index = device
+        t.dtype = "torch.bfloat16"
+        return t
+
+    def test_early_registration_populates_tracking(self) -> None:
+        """register_vram(checksums=False) should populate tracking with checksum=None."""
+        agent = self._make_agent()
+        agent._agent.register_memory.return_value = MagicMock()
+
+        agent.register_vram({"w0": self._fake_tensor(0xA000, 4096)}, checksums=False)
+
+        assert "w0" in agent._registered_names
+        assert len(agent._weight_manifest) == 1
+        assert agent._weight_manifest[0]["checksum"] is None
+        assert agent._weight_manifest[0]["addr"] == 0xA000
+
+    def test_early_registration_prevents_double_register(self) -> None:
+        """After register_vram(checksums=False), register_vram should skip (dedup)."""
+        agent = self._make_agent()
+        agent._agent.register_memory.return_value = MagicMock()
+
+        agent.register_vram({"w0": self._fake_tensor(0xA000, 4096)}, checksums=False)
+        agent.register_vram({"w0": self._fake_tensor(0xA000, 4096)})
+
+        # Only one register_memory call (the early one)
+        assert agent._agent.register_memory.call_count == 1
+
+    def test_finalize_manifest_fills_checksums(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """finalize_manifest should compute checksums for entries with checksum=None."""
+        import vllm_layercast.nixl_agent as mod
+        import vllm_layercast.checksum as checksum_mod
+
+        monkeypatch.setattr(checksum_mod, "is_enabled", lambda: True)
+        monkeypatch.setattr(mod, "_checksum_enabled", lambda: True)
+        monkeypatch.setattr(mod, "tensor_wyhash", lambda t: 0xDEADBEEF)
+
+        agent = self._make_agent()
+        agent._agent.register_memory.return_value = MagicMock()
+
+        t0 = self._fake_tensor(0xA000, 4096)
+        agent.register_vram({"w0": t0}, checksums=False)
+        assert agent._weight_manifest[0]["checksum"] is None
+
+        agent.finalize_manifest({"w0": t0})
+        assert agent._weight_manifest[0]["checksum"] == 0xDEADBEEF
+
+    def test_finalize_manifest_noop_when_checksums_disabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """finalize_manifest should be a no-op when checksums are disabled."""
+        import vllm_layercast.nixl_agent as mod
+
+        monkeypatch.setattr(mod, "_checksum_enabled", lambda: False)
+
+        agent = self._make_agent()
+        agent._agent.register_memory.return_value = MagicMock()
+
+        agent.register_vram({"w0": self._fake_tensor(0xA000, 4096)}, checksums=False)
+        agent.finalize_manifest({"w0": self._fake_tensor(0xA000, 4096)})
+        assert agent._weight_manifest[0]["checksum"] is None
+
+    def test_early_plus_local_only_coalesced(self) -> None:
+        """register_vram(checksums=False) for tensors + register_local_vram for coalesced buf."""
+        agent = self._make_agent()
+        early_handle = MagicMock()
+        local_handle = MagicMock()
+        agent._agent.register_memory.side_effect = [early_handle, local_handle]
+
+        agent.register_vram({"w0": self._fake_tensor(0xA000, 4096)}, checksums=False)
+        agent.register_local_vram({"__coalesced__": self._fake_tensor(0xC000, 8192)})
+
+        assert early_handle in agent._registered_descs
+        assert local_handle in agent._local_only_descs
+        assert "w0" in agent._registered_names
+        assert "__coalesced__" not in agent._registered_names
 
 
 # PeerTransferAssignment tests

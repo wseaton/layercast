@@ -1,12 +1,13 @@
-# Local build environment (personal infra details)
+
+__pycache__/
 .env.local
-
-# Rust build artifacts
-target/
-
 .pytest_cache/
+.ruff_cache/
 .venv/
 *.pyc
+# Local build environment (personal infra details)
+# Rust build artifacts
+autoresearch-results.tsv
 benchmark-logs/
-.ruff_cache/
-__pycache__/
+bug-reports/
+target/

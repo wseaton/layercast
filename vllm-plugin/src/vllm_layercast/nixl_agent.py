@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import time
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 from vllm_layercast.checksum import is_enabled as _checksum_enabled
@@ -92,6 +93,7 @@ class VramNixlAgent:
         self._agent.create_backend("UCX", ucx_init)
         self._name = name
         self._registered_descs: list[object] = []
+        self._local_only_descs: list[object] = []
         self._registered_names: set[str] = set()
         self._weight_manifest: list[dict[str, int | str | None]] = []
         log.info("agent_ready", name=name)
@@ -100,12 +102,26 @@ class VramNixlAgent:
     def name(self) -> str:
         return self._name
 
-    def register_vram(self, tensors: dict[str, "torch.Tensor"]) -> None:
+    @staticmethod
+    def _tensor_desc(tensor: "torch.Tensor") -> tuple[int, int, int]:
+        """Extract (addr, nbytes, device_id) from a GPU tensor."""
+        return (
+            tensor.data_ptr(),
+            tensor.nelement() * tensor.element_size(),
+            tensor.device.index if tensor.device.index is not None else 0,
+        )
+
+    def register_vram(
+        self, tensors: dict[str, "torch.Tensor"], *, checksums: bool = True
+    ) -> None:
         """Register GPU tensors with NIXL for RDMA transfers.
 
-        Each tensor is registered as a VRAM segment so remote agents can
-        read directly from this GPU's memory. Also saves the address manifest
-        for sharing with peers so they know where to read from.
+        Pins GPU pages with the RDMA NIC so remote agents can read from
+        (or write to) this GPU's memory. Builds a manifest for peer discovery.
+
+        Pass checksums=False when tensors are allocated but not yet filled
+        (e.g. before RDMA transfer). Call finalize_manifest() after data
+        arrives to backfill checksums.
         """
         if not tensors:
             return
@@ -119,15 +135,13 @@ class VramNixlAgent:
             )
             return
 
-        checksums_enabled = _checksum_enabled()
+        compute = checksums and _checksum_enabled()
         descs: list[tuple[int, int, int, str]] = []
         manifest: list[dict[str, int | str | None]] = []
         for param_name, tensor in new_tensors.items():
-            addr = tensor.data_ptr()
-            nbytes = tensor.nelement() * tensor.element_size()
-            device_id = tensor.device.index if tensor.device.index is not None else 0
+            addr, nbytes, device_id = self._tensor_desc(tensor)
             descs.append((addr, nbytes, device_id, param_name))
-            checksum = tensor_wyhash(tensor) if checksums_enabled else None
+            checksum = tensor_wyhash(tensor) if compute else None
             manifest.append(
                 {
                     "name": param_name,
@@ -146,6 +160,58 @@ class VramNixlAgent:
         self._registered_names.update(new_tensors.keys())
         self._weight_manifest.extend(manifest)
         log.info("vram_registered", count=len(descs))
+
+    def finalize_manifest(self, tensors: dict[str, "torch.Tensor"]) -> None:
+        """Backfill checksums for tensors registered with checksums=False."""
+        if not _checksum_enabled():
+            return
+
+        updated = 0
+        for entry in self._weight_manifest:
+            if entry["checksum"] is not None:
+                continue
+            tensor = tensors.get(str(entry["name"]))
+            if tensor is not None:
+                entry["checksum"] = tensor_wyhash(tensor)
+                updated += 1
+        if updated:
+            log.info("manifest_checksums_computed", count=updated)
+
+    def register_local_vram(self, tensors: dict[str, "torch.Tensor"]) -> None:
+        """Register GPU tensors as local NIXL destinations only.
+
+        Used by the receive path (_issue_and_wait_transfers) to register
+        destination buffers for inbound NIXL READs. Tracked separately from
+        serving registrations so they can be deregistered before exporting
+        metadata (NIXL's get_agent_metadata includes ALL registered memory,
+        and overlapping receive+serve registrations cause ERR_NOT_ALLOWED
+        when a third peer tries to load the metadata).
+        """
+        if not tensors:
+            return
+        descs: list[tuple[int, int, int, str]] = []
+        for name, tensor in tensors.items():
+            addr, nbytes, device_id = self._tensor_desc(tensor)
+            descs.append((addr, nbytes, device_id, name))
+        log.info("registering_local_vram", count=len(descs))
+        reg = self._agent.register_memory(descs, mem_type="VRAM")
+        self._local_only_descs.append(reg)
+        log.info("local_vram_registered", count=len(descs))
+
+    def deregister_local_vram(self) -> None:
+        """Deregister receive-side VRAM so get_agent_metadata() is clean.
+
+        Must be called after transfers complete but before get_metadata(),
+        otherwise the metadata blob contains both receive-side and serve-side
+        registrations for the same memory, which NIXL rejects with
+        ERR_NOT_ALLOWED on the consuming peer.
+        """
+        for desc in self._local_only_descs:
+            self._agent.deregister_memory(desc)
+        count = len(self._local_only_descs)
+        self._local_only_descs.clear()
+        if count:
+            log.info("local_vram_deregistered", count=count)
 
     def get_metadata(self) -> bytes:
         """Export this agent's metadata for sharing with remote agents."""
@@ -169,6 +235,90 @@ class VramNixlAgent:
         log.info("peer_loaded", peer=name)
         return name
 
+    def register_and_prep_local(
+        self, tensors: dict[str, "torch.Tensor"]
+    ) -> tuple[object, list[str]]:
+        """Register local VRAM and prep descriptors in a single pass.
+
+        Combines register_local_vram + prep for the two-phase transfer API.
+        Returns (prepped_handle, ordered_names) so callers can map tensor
+        names to descriptor indices for make_prepped_xfer.
+
+        Skips registration for tensors already registered via register_vram
+        (e.g. early pre-allocation). Only calls register_memory for truly
+        new tensors, saving ~6s of redundant RDMA pinning.
+        """
+        new_descs: list[tuple[int, int, int, str]] = []
+        prep_descs: list[tuple[int, int, int]] = []
+        names: list[str] = []
+        for name, tensor in tensors.items():
+            desc = self._tensor_desc(tensor)
+            prep_descs.append(desc)
+            names.append(name)
+            if name not in self._registered_names:
+                new_descs.append((*desc, name))
+
+        if new_descs:
+            reg = self._agent.register_memory(new_descs, mem_type="VRAM")
+            self._local_only_descs.append(reg)
+            log.info(
+                "registered_and_prepped_local",
+                new=len(new_descs),
+                skipped=len(names) - len(new_descs),
+                count=len(names),
+            )
+        else:
+            log.info(
+                "prepped_local_only",
+                skipped=len(names),
+                count=len(names),
+            )
+
+        handle = self._agent.prep_xfer_dlist("", prep_descs, mem_type="VRAM")
+        return handle, names
+
+    def prep_remote_descs(
+        self,
+        peer_name: str,
+        manifest_entries: list[tuple[int, int, int]],
+    ) -> object:
+        """Prep remote descriptors bound to a specific peer agent.
+
+        manifest_entries: list of (addr, size, device_id) in the same order
+        as the caller's index scheme.
+        Returns a prepped_handle for make_prepped_xfer.
+        """
+        handle = self._agent.prep_xfer_dlist(
+            peer_name, manifest_entries, mem_type="VRAM"
+        )
+        log.info("prepped_remote_descs", peer=peer_name, count=len(manifest_entries))
+        return handle
+
+    def read_prepped(
+        self,
+        local_handle: object,
+        local_indices: Sequence[int],
+        remote_handle: object,
+        remote_indices: Sequence[int],
+    ) -> object:
+        """Issue a transfer using pre-prepared descriptor handles.
+
+        Uses make_prepped_xfer (two-phase API) instead of initialize_xfer.
+        This avoids re-running populate() on descriptors, which is required
+        for correct multi-agent transfers.
+
+        Returns a transfer handle for wait_transfer().
+        """
+        handle = self._agent.make_prepped_xfer(
+            "READ",
+            local_handle,
+            local_indices,
+            remote_handle,
+            remote_indices,
+        )
+        self._agent.transfer(handle)
+        return handle
+
     def read_from_peer(
         self,
         local_tensor: "torch.Tensor",
@@ -181,14 +331,8 @@ class VramNixlAgent:
 
         Returns a transfer handle that should be passed to wait_transfer().
         """
-        local_addr = local_tensor.data_ptr()
-        local_len = local_tensor.nelement() * local_tensor.element_size()
-        local_device = (
-            local_tensor.device.index if local_tensor.device.index is not None else 0
-        )
-
         local_descs = self._agent.get_xfer_descs(
-            [(local_addr, local_len, local_device)],
+            [self._tensor_desc(local_tensor)],
             mem_type="VRAM",
         )
         remote_descs = self._agent.get_xfer_descs(
@@ -220,11 +364,7 @@ class VramNixlAgent:
 
         Returns a transfer handle for wait_transfer().
         """
-        local_base = local_buf.data_ptr()
-        local_device = (
-            local_buf.device.index if local_buf.device.index is not None else 0
-        )
-
+        local_base, _, local_device = self._tensor_desc(local_buf)
         local_descs_raw = [
             (local_base + off, length, local_device)
             for off, (_, length, _) in zip(offsets, remote_regions)
@@ -267,5 +407,13 @@ class VramNixlAgent:
 
     def close(self) -> None:
         """Release all registered memory and clean up."""
+        for desc in [*self._registered_descs, *self._local_only_descs]:
+            try:
+                self._agent.deregister_memory(desc)
+            except Exception as exc:
+                log.warning("deregister_memory_failed", error=str(exc))
         self._registered_descs.clear()
+        self._local_only_descs.clear()
+        self._registered_names.clear()
+        self._weight_manifest.clear()
         log.info("agent_closed", name=self._name)

@@ -104,6 +104,9 @@ class TransferMetrics:
     checksum_s: float | None = None
     compile_cache_gets: int | None = None
     compile_cache_hits: int | None = None
+    local_reg_s: float | None = None
+    serve_reg_s: float | None = None
+    total_reg_s: float | None = None
 
 
 @dataclass
@@ -125,7 +128,6 @@ class BenchmarkRun:
     cluster: str
     timestamp: str
     vllm_image: str
-    mesh_image: str
     log_dir: str
     results: list[ScenarioResult] = field(default_factory=list)
 
@@ -192,11 +194,9 @@ class K8sRunner:
         *,
         model: str,
         vllm_image: str,
-        mesh_image: str,
     ) -> None:
         """envsubst + kustomize image override, then kubectl apply."""
         vllm_name, vllm_tag = _split_image(vllm_image)
-        mesh_name, mesh_tag = _split_image(mesh_image)
 
         with tempfile.TemporaryDirectory() as tmp:
             # Expand model variables
@@ -212,9 +212,6 @@ class K8sRunner:
                 "resources:\n"
                 "  - resource.yaml\n"
                 "images:\n"
-                f"  - name: model-mesh\n"
-                f"    newName: {mesh_name}\n"
-                f'    newTag: "{mesh_tag}"\n'
                 f"  - name: vllm-plugin\n"
                 f"    newName: {vllm_name}\n"
                 f'    newTag: "{vllm_tag}"\n'
@@ -228,11 +225,9 @@ class K8sRunner:
         *,
         model: str,
         vllm_image: str,
-        mesh_image: str,
     ) -> None:
         """Delete resources from a templated YAML."""
         vllm_name, vllm_tag = _split_image(vllm_image)
-        mesh_name, mesh_tag = _split_image(mesh_image)
 
         with tempfile.TemporaryDirectory() as tmp:
             raw = Path(yaml_path).read_text()
@@ -246,9 +241,6 @@ class K8sRunner:
                 "resources:\n"
                 "  - resource.yaml\n"
                 "images:\n"
-                f"  - name: model-mesh\n"
-                f"    newName: {mesh_name}\n"
-                f'    newTag: "{mesh_tag}"\n'
                 f"  - name: vllm-plugin\n"
                 f"    newName: {vllm_name}\n"
                 f'    newTag: "{vllm_tag}"\n'
@@ -359,19 +351,29 @@ class K8sRunner:
                     pass
         self._stern_procs.clear()
 
-    def scrape_compile_cache_stats(self, scenario_label: str) -> dict[str, int]:
-        """Fetch compile cache stats from the model-mesh sidecar."""
-        pod = self.get_pod(scenario_label)
-        if not pod:
-            return {}
+    def scrape_compile_cache_stats(self) -> dict[str, int]:
+        """Fetch compile cache stats via port-forward to the metadata server."""
+        import socket
+
+        # Find a free local port
+        with socket.socket() as s:
+            s.bind(("", 0))
+            local_port = s.getsockname()[1]
+
+        pf = subprocess.Popen(
+            [*self.kubectl, "port-forward", "svc/layercast-metadata-server",
+             f"{local_port}:8081"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
         try:
-            raw = _run([
-                *self.kubectl, "exec", pod, "-c", "model-mesh", "--",
-                "curl", "-sf", "http://127.0.0.1:8081/internal/compile-cache-stats",
-            ])
+            time.sleep(2)
+            raw = _run(["curl", "-sf", f"http://127.0.0.1:{local_port}/compile-cache-stats"])
             return json.loads(raw) if raw else {}
         except (SubprocessError, json.JSONDecodeError):
             return {}
+        finally:
+            pf.kill()
+            pf.wait()
 
     def apply_raw(self, path: str) -> None:
         try:
@@ -439,6 +441,56 @@ def extract_log_field(log_path: Path, event: str, field_name: str) -> str | None
         return None
 
 
+def extract_event_timestamp(log_path: Path, event: str, *, first: bool = True) -> datetime | None:
+    """Extract the timestamp from the first or last matching structured log event."""
+    if not log_path.exists():
+        return None
+
+    match: str | None = None
+    for line in log_path.read_text(errors="replace").splitlines():
+        if f'"event": "{event}"' not in line:
+            continue
+        if first and match is None:
+            match = line
+        else:
+            match = line
+        if first and match is not None:
+            break
+
+    if not match:
+        return None
+
+    cleaned = _ANSI_RE.sub("", match)
+    m = re.search(r"\{.*\}", cleaned)
+    if not m:
+        return None
+
+    try:
+        data = json.loads(m.group())
+        ts = data.get("timestamp")
+        if ts:
+            return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return None
+
+
+def extract_reg_times(log_path: Path) -> tuple[float | None, float | None]:
+    """Extract local and serve VRAM registration durations from log timestamps.
+
+    Returns (local_reg_s, serve_reg_s). Each is the wall-clock time
+    between the first 'registering_*' and the last '*_registered' event.
+    """
+    local_start = extract_event_timestamp(log_path, "registering_local_vram", first=True)
+    local_end = extract_event_timestamp(log_path, "local_vram_registered", first=False)
+    serve_start = extract_event_timestamp(log_path, "registering_vram", first=True)
+    serve_end = extract_event_timestamp(log_path, "vram_registered", first=False)
+
+    local_s = (local_end - local_start).total_seconds() if local_start and local_end else None
+    serve_s = (serve_end - serve_start).total_seconds() if serve_start and serve_end else None
+    return local_s, serve_s
+
+
 def extract_metrics(log_path: Path) -> TransferMetrics:
     """Extract all transfer metrics from a log file."""
     metrics = TransferMetrics()
@@ -470,6 +522,12 @@ def extract_metrics(log_path: Path) -> TransferMetrics:
             metrics.checksum_s = float(raw)
         except ValueError:
             pass
+
+    local_s, serve_s = extract_reg_times(log_path)
+    metrics.local_reg_s = local_s
+    metrics.serve_reg_s = serve_s
+    if local_s is not None or serve_s is not None:
+        metrics.total_reg_s = (local_s or 0.0) + (serve_s or 0.0)
 
     return metrics
 
@@ -638,7 +696,6 @@ def format_markdown_table(run: BenchmarkRun) -> str:
         f"**Cluster**: {run.cluster}  ",
         f"**Date**: {run.timestamp}  ",
         f"**vLLM image**: `{run.vllm_image}`  ",
-        f"**Sidecar image**: `{run.mesh_image}`  ",
         f"**Logs**: `{run.log_dir}/`  ",
     ]
 
@@ -656,6 +713,7 @@ def format_markdown_table(run: BenchmarkRun) -> str:
         ("Scenario", 25),
         ("TTR (s)", 10),
         ("Weight Load (s)", 16),
+        ("Reg (s)", 10),
         ("Throughput", 12),
         ("Model Size", 12),
         ("Checksum (s)", 13),
@@ -668,6 +726,7 @@ def format_markdown_table(run: BenchmarkRun) -> str:
     for r in run.results:
         ttr = f"{r.ttr_s:.1f}" if r.ttr_s is not None else "N/A"
         wl = f"{r.metrics.weight_load_s:.1f}" if r.metrics.weight_load_s is not None else "N/A"
+        reg = f"{r.metrics.total_reg_s:.1f}" if r.metrics.total_reg_s is not None else "N/A"
         gbps = f"{r.metrics.transfer_gbps:.1f} GB/s" if r.metrics.transfer_gbps is not None else "N/A"
         model_gb = f"{r.metrics.transfer_bytes / 1e9:.1f} GB" if r.metrics.transfer_bytes else "N/A"
         cksum = f"{r.metrics.checksum_s:.1f}" if r.metrics.checksum_s is not None else "N/A"
@@ -681,6 +740,7 @@ def format_markdown_table(run: BenchmarkRun) -> str:
             (r.scenario, 25),
             (ttr, 10),
             (wl, 16),
+            (reg, 10),
             (gbps, 12),
             (model_gb, 12),
             (cksum, 13),
@@ -734,7 +794,7 @@ def run_hf_cold(
     result = ScenarioResult(scenario="HF Cold", method="hf-download")
 
     yaml_path = f"{cfg.deploy_dir}/hf-cold.yaml"
-    tmpl_kwargs = dict(model=cfg.model, vllm_image=cfg.vllm_image, mesh_image=cfg.mesh_image)
+    tmpl_kwargs = dict(model=cfg.model, vllm_image=cfg.vllm_image)
 
     k8s.delete_template(yaml_path, **tmpl_kwargs)
     time.sleep(2)
@@ -764,7 +824,7 @@ def run_nfs_cached(
     result = ScenarioResult(scenario="NFS Cached", method="nfs-read")
 
     yaml_path = f"{cfg.deploy_dir}/nfs-cached.yaml"
-    tmpl_kwargs = dict(model=cfg.model, vllm_image=cfg.vllm_image, mesh_image=cfg.mesh_image)
+    tmpl_kwargs = dict(model=cfg.model, vllm_image=cfg.vllm_image)
 
     k8s.apply_raw(f"{cfg.deploy_dir}/pvc.yaml")
     k8s.delete_raw("deployment", "bench-nfs-cached")
@@ -787,6 +847,16 @@ def run_nfs_cached(
     return result
 
 
+def _apply_metadata_server(k8s: K8sRunner, mesh_image: str | None) -> None:
+    """Apply the metadata-server kustomize, optionally overriding the image."""
+    _run([*k8s.kubectl, "apply", "-k", "deploy/metadata-server/"])
+    if mesh_image:
+        _run([*k8s.kubectl, "set", "image",
+              "deployment/metadata-server",
+              f"metadata-server={mesh_image}"])
+        info(f"Overrode metadata-server image: {mesh_image}")
+
+
 def run_nixl_p2p(
     k8s: K8sRunner, cfg: BenchConfig, log_dir: Path,
 ) -> ScenarioResult:
@@ -795,11 +865,10 @@ def run_nixl_p2p(
     result = ScenarioResult(scenario="NIXL P2P", method="nixl-gpudirect")
 
     yaml_path = f"{cfg.deploy_dir}/nixl-p2p.yaml"
-    tmpl_kwargs = dict(model=cfg.model, vllm_image=cfg.vllm_image, mesh_image=cfg.mesh_image)
+    tmpl_kwargs = dict(model=cfg.model, vllm_image=cfg.vllm_image)
 
-    # Ensure CRD + RBAC
-    _run(["kubectl", "--context", k8s.context, "apply", "-f", f"{cfg.e2e_dir}/crd.yaml"])
-    _run([*k8s.kubectl, "apply", "-f", f"{cfg.e2e_dir}/rbac.yaml"])
+    # Ensure metadata server + PVC
+    _apply_metadata_server(k8s, cfg.mesh_image)
     k8s.apply_raw(f"{cfg.deploy_dir}/pvc.yaml")
 
     k8s.delete_template(yaml_path, **tmpl_kwargs)
@@ -840,11 +909,10 @@ def run_nixl_scaling(
     info("=== Scenario: NIXL Scaling (seed -> c1 -> c2) ===")
 
     yaml_path = f"{cfg.deploy_dir}/nixl-scaling.yaml"
-    tmpl_kwargs = dict(model=cfg.model, vllm_image=cfg.vllm_image, mesh_image=cfg.mesh_image)
+    tmpl_kwargs = dict(model=cfg.model, vllm_image=cfg.vllm_image)
 
-    # Ensure CRD + RBAC
-    _run(["kubectl", "--context", k8s.context, "apply", "-f", f"{cfg.e2e_dir}/crd.yaml"])
-    _run([*k8s.kubectl, "apply", "-f", f"{cfg.e2e_dir}/rbac.yaml"])
+    # Ensure metadata server + PVC
+    _apply_metadata_server(k8s, cfg.mesh_image)
     k8s.apply_raw(f"{cfg.deploy_dir}/pvc.yaml")
 
     k8s.delete_template(yaml_path, **tmpl_kwargs)
@@ -883,7 +951,7 @@ def run_nixl_scaling(
         r.metrics = extract_metrics(log_paths[role])
 
         # Compile cache stats
-        cc_stats = k8s.scrape_compile_cache_stats(role)
+        cc_stats = k8s.scrape_compile_cache_stats()
         if cc_stats:
             r.metrics.compile_cache_gets = cc_stats.get("gets", 0)
             r.metrics.compile_cache_hits = sum(
@@ -934,16 +1002,15 @@ def reprocess_logs(log_dir: Path) -> list[ScenarioResult]:
 class BenchConfig:
     model: str
     vllm_image: str
-    mesh_image: str
     context: str
     namespace: str
     deploy_dir: str
-    e2e_dir: str
     skip_hf: bool = False
     skip_nfs: bool = False
     skip_nixl: bool = False
     skip_nixl_scaling: bool = False
     skip_populate: bool = False
+    mesh_image: str | None = None
 
 
 def info(msg: str) -> None:
@@ -958,9 +1025,9 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Layercast model load benchmarks")
     p.add_argument("--model", default=os.environ.get("BENCH_MODEL", "Qwen/Qwen2.5-32B"))
     p.add_argument("--vllm-image", default=os.environ.get(
-        "VLLM_IMAGE", "ghcr.io/wseaton/layercast:vllm-plugin-main"))
-    p.add_argument("--mesh-image", default=os.environ.get(
-        "MESH_IMAGE", "ghcr.io/wseaton/layercast:model-mesh-main"))
+        "VLLM_IMAGE", "ghcr.io/wseaton/layercast:vllm-plugin-feat-central-metadata-server"))
+    p.add_argument("--mesh-image", default=os.environ.get("MESH_IMAGE"),
+                    help="Override metadata-server image (default: use kustomize value)")
     p.add_argument("--context", default=os.environ.get("KUBE_CONTEXT", "coreweave-waldorf"))
     p.add_argument("--namespace", default=os.environ.get("BENCH_NS", "layercast"))
     p.add_argument("--skip-hf", action="store_true")
@@ -977,14 +1044,13 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     deploy_dir = "deploy/benchmark"
-    e2e_dir = "deploy/nixl-e2e"
 
     k8s = K8sRunner(args.context, args.namespace)
 
     # Cleanup mode
     if args.cleanup:
         info("Cleaning up all benchmark resources...")
-        tmpl = dict(model=args.model, vllm_image=args.vllm_image, mesh_image=args.mesh_image)
+        tmpl = dict(model=args.model, vllm_image=args.vllm_image)
         for yaml_name in ["nixl-p2p.yaml", "nixl-scaling.yaml", "nfs-cached.yaml", "hf-cold.yaml"]:
             k8s.delete_template(f"{deploy_dir}/{yaml_name}", **tmpl)
         k8s.delete_raw("job", "populate-model")
@@ -1008,7 +1074,6 @@ def main() -> None:
             cluster=args.context,
             timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             vllm_image=args.vllm_image,
-            mesh_image=args.mesh_image,
             log_dir=str(log_dir),
             results=results,
         )
@@ -1025,16 +1090,15 @@ def main() -> None:
     cfg = BenchConfig(
         model=args.model,
         vllm_image=args.vllm_image,
-        mesh_image=args.mesh_image,
         context=args.context,
         namespace=args.namespace,
         deploy_dir=deploy_dir,
-        e2e_dir=e2e_dir,
         skip_hf=args.skip_hf,
         skip_nfs=args.skip_nfs,
         skip_nixl=args.skip_nixl,
         skip_nixl_scaling=args.skip_nixl_scaling,
         skip_populate=args.skip_populate,
+        mesh_image=args.mesh_image,
     )
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -1044,7 +1108,8 @@ def main() -> None:
     info("Benchmark configuration:")
     info(f"  Model:      {cfg.model}")
     info(f"  vLLM image: {cfg.vllm_image}")
-    info(f"  Mesh image: {cfg.mesh_image}")
+    if cfg.mesh_image:
+        info(f"  Mesh image: {cfg.mesh_image}")
     info(f"  Context:    {cfg.context}")
     info(f"  Namespace:  {cfg.namespace}")
     info(f"  Log dir:    {log_dir}")
@@ -1059,7 +1124,7 @@ def main() -> None:
         k8s.delete_raw("job", "populate-model")
         k8s.apply_template(
             f"{deploy_dir}/populate-job.yaml",
-            model=cfg.model, vllm_image=cfg.vllm_image, mesh_image=cfg.mesh_image,
+            model=cfg.model, vllm_image=cfg.vllm_image,
         )
         info("Waiting for populate job...")
         if not k8s.wait_job("populate-model"):
@@ -1087,7 +1152,6 @@ def main() -> None:
         cluster=cfg.context,
         timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         vllm_image=cfg.vllm_image,
-        mesh_image=cfg.mesh_image,
         log_dir=str(log_dir),
         results=results,
     )

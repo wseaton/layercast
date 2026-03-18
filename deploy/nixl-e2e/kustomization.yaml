@@ -1,6 +1,6 @@
 # NIXL GPUDirect P2P e2e test.
 #
-# Deploys model-mesh daemon + vLLM with layercast plugin.
+# Deploys central metadata server + vLLM pods with layercast plugin.
 # Pod-0 loads from HF (seeds). Pod-1 loads via NIXL GPUDirect from pod-0's GPU.
 #
 # Usage:
@@ -14,15 +14,14 @@ namespace: layercast
 
 resources:
   - namespace.yaml
-  - crd.yaml
-  - rbac.yaml
+  - ../metadata-server/
   - services.yaml
   - vllm.yaml
 
 images:
-  - name: model-mesh
+  - name: metadata-server
     newName: ghcr.io/wseaton/layercast
-    newTag: model-mesh-main
+    newTag: metadata-server-main
   - name: vllm-plugin
     newName: ghcr.io/wseaton/layercast
     newTag: vllm-plugin-main

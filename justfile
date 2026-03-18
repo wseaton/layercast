@@ -28,9 +28,6 @@ check:
     cargo test --workspace
 
 # CRDs
-crd-gen:
-    cargo run -p discovery --bin crd-gen > deploy/crds/podcache.yaml
-
 kopium-inferencepool:
     kopium -f deploy/external-crds/inferencepool.yaml --docs > crates/discovery/src/inference_pool.rs
     cargo fmt -p discovery
@@ -47,8 +44,8 @@ test-plugin:
     cd vllm-plugin && uv run pytest tests/ -v
 
 # Container images
-build-model-mesh:
-    docker build -t model-mesh:dev -f Containerfile.model-mesh .
+build-metadata-server:
+    docker build -t metadata-server:dev -f Containerfile.metadata-server .
 
 build-vllm-plugin:
     docker build -t vllm-plugin:dev -f Containerfile.vllm-plugin .

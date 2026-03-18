@@ -1,8 +1,6 @@
 # layercast-values.yaml
 # Overlay for llm-d-modelservice chart.
-# Injects the layercast sidecar + shared volumes into the vLLM pod.
-
-serviceAccountOverride: model-mesh
+# Points vLLM at the central layercast metadata server (no sidecar needed).
 
 modelArtifacts:
   name: Qwen/Qwen2.5-32B
@@ -19,19 +17,31 @@ decode:
         - "--max-model-len=2048"
         - "--gpu-memory-utilization=0.85"
       env:
-        - name: LAYERCAST_SOCKET
-          value: /var/run/layercast/daemon.sock
-        # torch.compile remote cache via sidecar RESP2 shim
+        - name: LAYERCAST_SERVER_ADDR
+          value: layercast-metadata-server.layercast.svc.cluster.local:50051
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        # torch.compile remote cache via central metadata server
         - name: TORCHINDUCTOR_FX_GRAPH_REMOTE_CACHE
           value: "1"
         - name: TORCHINDUCTOR_REDIS_HOST
-          value: "127.0.0.1"
+          value: layercast-metadata-server.layercast.svc.cluster.local
         - name: TORCHINDUCTOR_REDIS_PORT
           value: "6379"
         - name: FLASHINFER_WORKSPACE_DIR
           value: /tmp/flashinfer
         - name: HOME
           value: /tmp
+        # Seed pods: set to "0" to skip peer discovery wait.
+        # Consumer pods: leave unset (server default: 120s).
+        # - name: PEER_DISCOVERY_TIMEOUT
+        #   value: "0"
       resources:
         requests:
           memory: "16Gi"
@@ -45,8 +55,6 @@ decode:
           rdma/ib: 1
       mountModelVolume: false
       volumeMounts:
-        - name: layercast-ipc
-          mountPath: /var/run/layercast
         - name: shm
           mountPath: /dev/shm
       extraConfig:
@@ -54,86 +62,13 @@ decode:
           capabilities:
             add: ["IPC_LOCK"]
 
-    # ── Layercast sidecar ──────────────────────────────────────────
-    - name: model-mesh
-      image: "ghcr.io/wseaton/layercast:model-mesh-latest"
-      modelCommand: custom
-      command: ["model-mesh"]
-      env:
-        - name: POD_NAME
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.name
-        - name: POD_NAMESPACE
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.namespace
-        - name: POD_IP
-          valueFrom:
-            fieldRef:
-              fieldPath: status.podIP
-        - name: NODE_NAME
-          valueFrom:
-            fieldRef:
-              fieldPath: spec.nodeName
-        - name: IPC_SOCKET_PATH
-          value: /var/run/layercast/daemon.sock
-        - name: NIXL_CONTROL_PORT
-          value: "7903"
-        - name: MODEL_NAME
-          value: Qwen/Qwen2.5-32B
-        - name: COMPILE_CACHE_ENABLED
-          value: "true"
-        - name: COMPILE_CACHE_ADDR
-          value: "127.0.0.1:6379"
-        - name: RUST_LOG
-          value: model_mesh=debug,discovery=debug
-        # Seed pods: set to "0" to skip peer discovery wait.
-        # Consumer pods: leave at default (120s) or tune as needed.
-        # - name: PEER_DISCOVERY_TIMEOUT
-        #   value: "0"
-      ports:
-        - containerPort: 8081
-          name: http
-        - containerPort: 7903
-          name: nixl-control
-      resources:
-        requests:
-          memory: "4Gi"
-          cpu: "2"
-          # Explicitly zero GPU to prevent chart from auto-injecting nvidia.com/gpu
-          nvidia.com/gpu: "0"
-        limits:
-          memory: "8Gi"
-          cpu: "4"
-          nvidia.com/gpu: "0"
-      mountModelVolume: false
-      volumeMounts:
-        - name: layercast-ipc
-          mountPath: /var/run/layercast
-        - name: compile-cache
-          mountPath: /var/cache/layercast/compile-cache
-      extraConfig:
-        securityContext:
-          runAsUser: 2000
-          capabilities:
-            add: ["IPC_LOCK"]
-        readinessProbe:
-          httpGet:
-            path: /healthz
-            port: 8081
-          initialDelaySeconds: 5
-          periodSeconds: 5
-          timeoutSeconds: 2
+  # ── Pod labels for metadata server crash detection ───────────────
+  podLabels:
+    layercast.io/managed: "true"
 
   # ── Shared volumes ────────────────────────────────────────────────
   volumes:
-    - name: layercast-ipc
-      emptyDir: {}
     - name: shm
       emptyDir:
         medium: Memory
         sizeLimit: 4Gi
-    - name: compile-cache
-      emptyDir:
-        sizeLimit: 10Gi

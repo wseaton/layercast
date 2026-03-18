@@ -1,8 +1,11 @@
 pub mod compile_cache;
 pub mod config;
+pub mod grpc_service;
 pub mod hf_api;
-pub mod ipc;
-pub mod nixl_vram_store;
+pub mod leader;
+pub mod pod_watcher;
 pub mod proto;
 pub mod resp;
+pub mod session;
+pub mod state;
 pub mod transfer_plan;

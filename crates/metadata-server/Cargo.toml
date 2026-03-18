@@ -1,5 +1,5 @@
 [package]
-name = "model-mesh"
+name = "metadata-server"
 version = "0.3.0"
 edition.workspace = true
 
@@ -13,17 +13,20 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }
+rand = { workspace = true }
+futures = { workspace = true }
 discovery = { path = "../discovery" }
 clap = { version = "4", features = ["derive", "env"] }
 hf-hub = { version = "0.4", features = ["tokio"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
-futures = { workspace = true }
 prost = "0.13"
+tonic = "0.12"
 kube = { workspace = true }
 k8s-openapi = { workspace = true }
+jiff = "0.2"
 
 [build-dependencies]
-prost-build = "0.13"
+tonic-build = "0.12"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

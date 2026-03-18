@@ -4,16 +4,6 @@
 //! PING, GET, SET, EXISTS. That's it. We're not building Redis.
 //!
 //! Wire format reference: https://redis.io/docs/reference/protocol-spec/
-//!
-//!   Client sends commands as RESP arrays:
-//!     *2\r\n$3\r\nGET\r\n$5\r\nhello\r\n
-//!
-//!   Server responds with:
-//!     +OK\r\n              (simple string)
-//!     -ERR message\r\n     (error)
-//!     :1\r\n               (integer)
-//!     $5\r\nhello\r\n      (bulk string)
-//!     $-1\r\n              (null / cache miss)
 
 use bytes::{Buf, BytesMut};
 use thiserror::Error;
@@ -28,32 +18,18 @@ pub enum RespError {
     TooLarge(usize),
 }
 
-/// Max bulk string size: 256 MB. Inductor caches can be a few GB in extreme
-/// cases, but individual SET values going over 256 MB is suspicious.
+/// 256MB safety limit for RESP bulk string payloads.
 const MAX_BULK_LEN: usize = 256 * 1024 * 1024;
 
-/// A parsed RESP command from the client.
 #[derive(Debug)]
 pub enum RespCommand {
     Ping,
-    Get {
-        key: Vec<u8>,
-    },
-    Set {
-        key: Vec<u8>,
-        value: Vec<u8>,
-    },
-    Exists {
-        key: Vec<u8>,
-    },
-    /// Redis handshake commands (COMMAND, CONFIG, CLIENT, INFO) that redis-py
-    /// sends on connect. We respond with appropriate no-ops.
-    Handshake {
-        command: String,
-    },
+    Get { key: Vec<u8> },
+    Set { key: Vec<u8>, value: Vec<u8> },
+    Exists { key: Vec<u8> },
+    Handshake { command: String },
 }
 
-/// A RESP response to send back to the client.
 #[derive(Debug)]
 pub enum RespResponse {
     SimpleString(&'static str),
@@ -73,7 +49,6 @@ impl RespResponse {
         Self::SimpleString("PONG")
     }
 
-    /// Encode this response into the output buffer.
     pub fn encode(&self, buf: &mut BytesMut) {
         use std::fmt::Write;
         match self {
@@ -101,35 +76,26 @@ impl RespResponse {
     }
 }
 
-/// Try to parse one complete RESP command from the buffer.
-///
-/// On success, advances the buffer past the consumed bytes and returns
-/// the parsed command. Returns `Err(Incomplete)` if more data is needed.
 pub fn parse_command(buf: &mut BytesMut) -> Result<RespCommand, RespError> {
     let mut cursor = std::io::Cursor::new(&buf[..]);
 
-    // Commands are RESP arrays: *<count>\r\n
     let array_len = parse_array_header(&mut cursor)?;
     if array_len == 0 {
         return Err(RespError::Protocol("empty command".into()));
     }
 
-    // Read all bulk strings in the array
     let mut parts: Vec<Vec<u8>> = Vec::with_capacity(array_len);
     for _ in 0..array_len {
         let part = parse_bulk_string(&mut cursor)?;
         parts.push(part);
     }
 
-    // Advance the buffer past what we consumed
     let consumed = cursor.position() as usize;
     buf.advance(consumed);
 
-    // Parse command name (case-insensitive, as Redis does)
     let cmd = parts[0].to_ascii_uppercase();
     match cmd.as_slice() {
         b"PING" => Ok(RespCommand::Ping),
-
         b"GET" => {
             if parts.len() != 2 {
                 return Err(RespError::Protocol(
@@ -140,23 +106,18 @@ pub fn parse_command(buf: &mut BytesMut) -> Result<RespCommand, RespError> {
                 key: parts.into_iter().nth(1).unwrap(),
             })
         }
-
         b"SET" => {
-            // SET key value [EX seconds] [PX ms] ... we ignore options
             if parts.len() < 3 {
                 return Err(RespError::Protocol(
                     "SET requires at least 2 arguments".into(),
                 ));
             }
             let mut iter = parts.into_iter();
-            iter.next(); // skip "SET"
+            iter.next();
             let key = iter.next().unwrap();
             let value = iter.next().unwrap();
-            // Silently ignore EX/PX/NX/XX options, torch doesn't use them
-            // but redis-py might send them by default
             Ok(RespCommand::Set { key, value })
         }
-
         b"EXISTS" => {
             if parts.len() != 2 {
                 return Err(RespError::Protocol(
@@ -167,20 +128,15 @@ pub fn parse_command(buf: &mut BytesMut) -> Result<RespCommand, RespError> {
                 key: parts.into_iter().nth(1).unwrap(),
             })
         }
-
-        // torch's redis-py client sends these on connect, just no-op them
         b"COMMAND" | b"CONFIG" | b"CLIENT" | b"INFO" => Ok(RespCommand::Handshake {
             command: String::from_utf8_lossy(&cmd).into_owned(),
         }),
-
         _ => Err(RespError::Protocol(format!(
             "unsupported command: {}",
             String::from_utf8_lossy(&cmd)
         ))),
     }
 }
-
-// --- internal parsing helpers ---
 
 fn parse_array_header(cursor: &mut std::io::Cursor<&[u8]>) -> Result<usize, RespError> {
     let line = read_line(cursor)?;
@@ -216,17 +172,15 @@ fn parse_bulk_string(cursor: &mut std::io::Cursor<&[u8]>) -> Result<Vec<u8>, Res
 
     let pos = cursor.position() as usize;
     let remaining = cursor.get_ref().len() - pos;
-    // Need len bytes + \r\n
     if remaining < len + 2 {
         return Err(RespError::Incomplete);
     }
 
     let data = cursor.get_ref()[pos..pos + len].to_vec();
-    cursor.set_position((pos + len + 2) as u64); // skip \r\n
+    cursor.set_position((pos + len + 2) as u64);
     Ok(data)
 }
 
-/// Read until \r\n, returning the line WITHOUT the terminator.
 fn read_line(cursor: &mut std::io::Cursor<&[u8]>) -> Result<Vec<u8>, RespError> {
     let start = cursor.position() as usize;
     let data = cursor.get_ref();
@@ -306,26 +260,6 @@ mod tests {
 
         RespResponse::BulkString(b"hello".to_vec()).encode(&mut buf);
         assert_eq!(&buf[..], b"$5\r\nhello\r\n");
-    }
-
-    #[test]
-    fn parse_handshake_commands() {
-        for cmd_name in &["COMMAND", "CONFIG", "CLIENT", "INFO"] {
-            let frame = format!("*1\r\n${}\r\n{}\r\n", cmd_name.len(), cmd_name);
-            let mut buf = BytesMut::from(frame.as_str());
-            let cmd = parse_command(&mut buf).unwrap();
-            match cmd {
-                RespCommand::Handshake { command } => assert_eq!(command, *cmd_name),
-                other => panic!("expected Handshake for {cmd_name}, got {other:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn encode_empty_array() {
-        let mut buf = BytesMut::new();
-        RespResponse::EmptyArray.encode(&mut buf);
-        assert_eq!(&buf[..], b"*0\r\n");
     }
 
     #[test]

@@ -8,9 +8,9 @@ Distributed model weight loading for Kubernetes. Accelerates LLM cold starts by 
 
 ## How it works
 
-A seed pod downloads the model once (from HuggingFace or a shared filesystem). Every subsequent pod pulls weights straight from the seed's GPU memory at ~8 GB/s over InfiniBand.
+A seed pod downloads the model once (from HuggingFace or a shared filesystem). Every subsequent pod pulls weights straight from the seed's GPU memory over InfiniBand, with multi-peer transfers scaling across available RDMA paths.
 
-Additionally, we also have infrastrcuture for torch.compile cache propogation between peers, so the second consumer onwards skips codegen entirely. This is done by implementing the remote torch dynamo Redis cache API but backed by cooperative peering.
+Additionally, we also have infrastructure for torch.compile cache propagation between peers, so the second consumer onwards skips codegen entirely. This is done by implementing the remote torch dynamo Redis cache API but backed by cooperative peering.
 
 ```mermaid
 graph TB
@@ -34,20 +34,22 @@ graph TB
 
 The vLLM plugin tries each source in priority order, falling through on failure:
 
-1. **NIXL GPUDirect** - VRAM-to-VRAM transfer from a peer pod (~8 GB/s over IB)
+1. **NIXL GPUDirect** - VRAM-to-VRAM transfer from peer pods (~27 GB/s multi-peer over IB)
 2. **vLLM default** - HuggingFace download or shared filesystem read
 
-## Benchmark results (Qwen2.5-32B, CoreWeave H100 SXM5)
+## Benchmark results (Qwen2.5-32B, CoreWeave H200 SXM)
 
-Weight transfer throughput over InfiniBand with NIXL GPUDirect RDMA:
+Weight transfer throughput over InfiniBand (ConnectX-7 400 Gb/s) with NIXL GPUDirect RDMA:
 
-| Metric | Value |
-|--------|-------|
-| Transfer speed | 7.7 - 8.7 GB/s |
-| Weight load (single consumer) | ~26s for 60GB model |
-| Checksum verification | ~35ms |
+| Scenario | Weight Load | Throughput | Notes |
+|----------|-------------|------------|-------|
+| Single peer (c1 from seed) | ~20s | 8-9 GB/s | One RDMA path |
+| Multi-peer (c2 from seed + c1) | ~20s | ~27 GB/s | Parallel transfers across separate NICs |
+| RDMA wire speed (multi-peer) | 1.6s | ~40 GB/s | Raw transfer excluding setup/checksum |
 
-Measured across multiple consumers pulling from a single seed. Actual time-to-ready depends on vLLM startup, torch.compile, and model config.
+Multi-peer transfers use LPT bin-packing to split tensors across available peers, issuing parallel RDMA reads. Pods must land on separate nodes (anti-affinity) for separate NIC paths; same-node peers share a PCIe link and don't benefit from parallelism.
+
+Actual time-to-ready includes vLLM startup (~17s) and optional torch.compile. The compile cache eliminates codegen for the second consumer onwards.
 
 ## Project structure
 
@@ -125,6 +127,8 @@ stateDiagram-v2
 | `LAYERCAST_COALESCE_THRESHOLD` | `1MB` | Coalesce NIXL transfers below this size |
 | `LAYERCAST_NIXL_NUM_THREADS` | `4` | Number of NIXL transfer threads |
 | `LAYERCAST_IB_SL` | `1` | InfiniBand service level |
+| `LAYERCAST_PARALLEL_PEER_XFER` | `1` | Parallel multi-peer RDMA transfers (0 to serialize) |
+| `LAYERCAST_TRANSFER_TIMEOUT` | `120` | Max seconds per NIXL transfer before timeout |
 | `HF_TOKEN` | *(none)* | HuggingFace token for gated model access |
 
 ## Quick start

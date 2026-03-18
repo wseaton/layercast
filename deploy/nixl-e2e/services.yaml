@@ -1,20 +1,3 @@
-# Client-facing service for model-mesh HTTP proxy (optional, for debugging).
-apiVersion: v1
-kind: Service
-metadata:
-  name: model-mesh
-  labels:
-    app: vllm
-    app.kubernetes.io/part-of: layercast
-spec:
-  selector:
-    app: vllm
-  ports:
-    - port: 80
-      targetPort: 8080
-      name: http
-
----
 # Service targeting only the seed pod (used by consumer init container).
 apiVersion: v1
 kind: Service

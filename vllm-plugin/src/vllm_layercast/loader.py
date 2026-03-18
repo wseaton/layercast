@@ -46,10 +46,15 @@ except ImportError:
 from huggingface_hub import try_to_load_from_cache  # noqa: E402
 from safetensors import safe_open  # noqa: E402
 
-from vllm_layercast.backend_rust import RustSidecarBackend  # noqa: E402
+from vllm_layercast.backend_rust import LayercastBackend  # noqa: E402
 from vllm_layercast.checksum import is_enabled as _checksum_enabled  # noqa: E402
 from vllm_layercast.checksum import verify_checksums  # noqa: E402
 from vllm_layercast.nixl_agent import VramNixlAgent, _COALESCE_THRESHOLD  # noqa: E402
+
+# Issue all peer RDMA transfers before waiting, overlapping reads from
+# multiple sources. Set to "0" to serialize transfers (useful if all
+# peers share a single NIC/PCIe link and contention hurts throughput).
+_PARALLEL_PEER_XFER = os.environ.get("LAYERCAST_PARALLEL_PEER_XFER", "1") != "0"
 from vllm_layercast.proto import PeerNixlMd, Prepared, TensorInfo  # noqa: E402
 
 # Keep NIXL agents alive for the process lifetime so remote peers can
@@ -60,10 +65,9 @@ _NIXL_AGENTS_LOCK = threading.Lock()
 
 # Keep the backend + event loop alive for the process lifetime.
 # Without this, Python GC collects the model loader after load_model()
-# returns, closing the Unix socket. The sidecar interprets the EOF as a
-# crash and auto-unadvertises, nuking the CRD entry before any consumer
-# can discover us.
-_BACKEND_KEEPALIVE: tuple[asyncio.AbstractEventLoop, RustSidecarBackend] | None = None
+# returns, closing the gRPC channel. The backend's heartbeat task
+# needs the channel alive to periodically re-register with the server.
+_BACKEND_KEEPALIVE: tuple[asyncio.AbstractEventLoop, LayercastBackend] | None = None
 
 
 class LayercastModelLoader(BaseModelLoader):
@@ -76,7 +80,7 @@ class LayercastModelLoader(BaseModelLoader):
         super().__init__(load_config)
         log.info("init", pid=os.getpid())
         self._nixl_agent: VramNixlAgent | None = None
-        self._backend: RustSidecarBackend | None = None
+        self._backend: LayercastBackend | None = None
         self._backend_loop: asyncio.AbstractEventLoop | None = None
         self._weight_files_cache: dict[str, list[str]] = {}
         self._weight_map: dict[str, str] = {}  # tensor name -> shard file
@@ -119,6 +123,12 @@ class LayercastModelLoader(BaseModelLoader):
             loaded = True
             elapsed = time.monotonic() - t_start
             log.info("weights_loaded", method="nixl", elapsed_s=elapsed, model=repo_id)
+            # Clean up coalesced receive buffer, finalize checksums
+            if self._nixl_agent:
+                self._nixl_agent.deregister_local_vram()
+                self._nixl_agent.finalize_manifest(
+                    {n: p.data for n, p in model.named_parameters() if p.is_cuda}
+                )
 
         # fall back to vLLM default, either local fs or HF download
         if not loaded:
@@ -129,7 +139,7 @@ class LayercastModelLoader(BaseModelLoader):
                 "weights_loaded", method="hf_default", elapsed_s=elapsed, model=repo_id
             )
 
-        # register VRAM with the daemon so we can serve peers
+        # publish VRAM so future peers can NIXL-load from us
         self._publish_vram(model, repo_id, revision, weight_files, tp_rank)
 
     def load_model(
@@ -160,22 +170,39 @@ class LayercastModelLoader(BaseModelLoader):
             weight_files = self._get_weight_files(model_config)
 
         if peers:
-            # Overlap NIXL agent + UCX backend init (~3s) with model init (~16s).
-            # Both are independent: model init builds the graph on meta device,
-            # while NIXL creates UCX workers and endpoints.
-            with concurrent.futures.ThreadPoolExecutor(1) as executor:
-                agent_future = executor.submit(self._ensure_nixl_agent, tp_rank)
-                model = initialize_model(vllm_config, prefix=prefix)
-                # Collect the agent (will be instant if model init took longer)
+            # Overlap NIXL setup with model init in a background thread.
+            peer = peers[0]
+            remote_manifest = {t.name: t for t in peer.tensors}
+
+            def _init_agent_and_register() -> dict[str, torch.Tensor] | None:
                 try:
-                    agent_future.result(timeout=30)
+                    agent = self._ensure_nixl_agent(tp_rank)
+                    pre_alloc = _pre_allocate_from_manifest(remote_manifest)
+                    if pre_alloc:
+                        agent.register_vram(pre_alloc, checksums=False)
+                    return pre_alloc
+                except Exception as exc:
+                    log.error("nixl_pre_register_failed", error=str(exc))
+                    return None
+
+            with concurrent.futures.ThreadPoolExecutor(1) as executor:
+                reg_future = executor.submit(_init_agent_and_register)
+                model = initialize_model(vllm_config, prefix=prefix)
+                try:
+                    pre_allocated = reg_future.result(timeout=60)
                 except Exception as exc:
                     log.error("nixl_agent_init_failed", error=str(exc))
+                    pre_allocated = None
+
             if self._nixl_agent is None:
                 log.error("nixl_agent_not_initialized_after_init")
                 raise RuntimeError(
                     "NIXL agent failed to initialize, cannot proceed with GPUDirect load"
                 )
+
+            if pre_allocated:
+                _bind_pre_allocated(model, pre_allocated, remote_manifest)
+
             if self._try_nixl_load(
                 model,
                 repo_id,
@@ -193,6 +220,10 @@ class LayercastModelLoader(BaseModelLoader):
                 # Move computed buffers (e.g. rotary cos_sin_cache) from
                 # CPU to GPU. NIXL only transfers parameters, not buffers.
                 model = model.to(target_device)
+                self._nixl_agent.deregister_local_vram()
+                self._nixl_agent.finalize_manifest(
+                    {n: p.data for n, p in model.named_parameters() if p.is_cuda}
+                )
                 self._publish_vram(model, repo_id, revision, weight_files, tp_rank)
                 return model
             # NIXL load failed after init. This is a fatal error since
@@ -281,8 +312,14 @@ class LayercastModelLoader(BaseModelLoader):
             remote=len(remote_manifest),
         )
 
+        agent.register_vram(local_tensors, checksums=False)
+
         failed = _issue_and_wait_transfers(
-            agent, peer_name, remote_manifest, local_tensors
+            agent,
+            peer_name,
+            remote_manifest,
+            local_tensors,
+            skip_large_registration=True,
         )
 
         if failed:
@@ -319,8 +356,10 @@ class LayercastModelLoader(BaseModelLoader):
     ) -> bool:
         """Transfer weights from multiple peers using the scheduler's plan.
 
-        Each PeerTransferAssignment specifies which tensors to pull from which
-        peer. This spreads the transfer load across peers for ~linear speedup.
+        Uses NIXL's two-phase prep_xfer_dlist + make_prepped_xfer API.
+        initialize_xfer re-runs populate() on every call, which corrupts
+        backend state when multiple remote agents are involved. The prepped
+        API populates once and reuses cached results via index selection.
         """
         plan = prepared.transfer_plan
         log.info(
@@ -329,28 +368,33 @@ class LayercastModelLoader(BaseModelLoader):
             total_assignments=sum(len(a.assigned_tensors) for a in plan),
         )
 
-        # Build a unified remote manifest from the first peer (all peers
-        # have the same model, so tensor metadata is identical).
-        all_tensors = prepared.peers[0].tensors if prepared.peers else []
-        remote_manifest: dict[str, TensorInfo] = {t.name: t for t in all_tensors}
-        if not remote_manifest:
-            log.warning("nixl_empty_manifest")
-            return False
-
-        # Load metadata for all peers.
+        # Load metadata for all peers and build per-peer manifests.
         peer_names: dict[str, str] = {}
+        peer_manifests: dict[str, dict[str, TensorInfo]] = {}
         for assignment in plan:
             peer_names[assignment.agent_name] = agent.load_peer_metadata(
                 assignment.nixl_md
             )
+            peer_manifests[assignment.agent_name] = {
+                t.name: t for t in assignment.tensors
+            }
+            sample = assignment.tensors[0] if assignment.tensors else None
             log.info(
                 "nixl_peer_loaded",
                 peer=peer_names[assignment.agent_name],
                 assigned_tensors=len(assignment.assigned_tensors),
+                total_tensors=len(assignment.tensors),
+                sample_name=sample.name if sample else "",
+                sample_addr=hex(sample.addr) if sample else "",
             )
 
+        first_manifest = peer_manifests[plan[0].agent_name]
+        if not first_manifest:
+            log.warning("nixl_empty_manifest")
+            return False
+
         t_xfer = time.monotonic()
-        local_tensors = _materialize_params(model, remote_manifest)
+        local_tensors = _materialize_params(model, first_manifest)
         if not local_tensors:
             log.warning("nixl_no_matching_params")
             return False
@@ -358,36 +402,83 @@ class LayercastModelLoader(BaseModelLoader):
         log.info(
             "nixl_materialized",
             matched=len(local_tensors),
-            remote=len(remote_manifest),
+            remote=len(first_manifest),
             peers=len(plan),
         )
 
-        # Issue transfers per peer, collect all failures.
+        # Register local VRAM and prep descriptors in one pass.
+        local_handle, local_names = agent.register_and_prep_local(local_tensors)
+        local_name_to_idx = {n: i for i, n in enumerate(local_names)}
+
+        # Issue transfers per peer. When parallel mode is enabled, all
+        # transfers are issued before waiting (overlaps RDMA from separate
+        # NICs). Default is sequential (issue + wait per peer) to avoid
+        # contention on shared NIC/PCIe links.
         all_failed: list[str] = []
+        in_flight: list[tuple[str, list[str], object]] = []
         for assignment in plan:
             peer_name = peer_names[assignment.agent_name]
-            # Filter local_tensors to only those assigned to this peer.
+            peer_manifest = peer_manifests[assignment.agent_name]
             assigned_set = set(assignment.assigned_tensors)
-            peer_local = {n: t for n, t in local_tensors.items() if n in assigned_set}
-            if not peer_local:
+
+            remote_entries: list[tuple[int, int, int]] = []
+            remote_names: list[str] = []
+            local_indices: list[int] = []
+            for name in assigned_set:
+                if name not in peer_manifest or name not in local_name_to_idx:
+                    continue
+                info = peer_manifest[name]
+                remote_entries.append((info.addr, info.size, info.device_id))
+                remote_names.append(name)
+                local_indices.append(local_name_to_idx[name])
+
+            if not remote_entries:
                 continue
 
-            # Build a per-peer manifest (same data, just scoped).
-            peer_manifest = {
-                n: remote_manifest[n] for n in peer_local if n in remote_manifest
-            }
-
-            failed = _issue_and_wait_transfers(
-                agent, peer_name, peer_manifest, peer_local
+            log.info(
+                "nixl_peer_transfer_start",
+                peer=peer_name,
+                tensors=len(remote_entries),
+                sample_name=remote_names[0],
+                sample_remote_addr=hex(remote_entries[0][0]),
+                sample_local_addr=hex(local_tensors[remote_names[0]].data_ptr()),
             )
-            if failed:
+
+            try:
+                remote_handle = agent.prep_remote_descs(peer_name, remote_entries)
+                handle = agent.read_prepped(
+                    local_handle,
+                    local_indices,
+                    remote_handle,
+                    range(len(remote_entries)),
+                )
+                if _PARALLEL_PEER_XFER:
+                    in_flight.append((peer_name, remote_names, handle))
+                else:
+                    agent.wait_transfer(handle)
+            except (RuntimeError, TimeoutError) as exc:
                 log.warning(
                     "nixl_peer_partial_failure",
                     peer=peer_name,
-                    failed=len(failed),
-                    assigned=len(peer_local),
+                    failed=len(remote_names),
+                    assigned=len(remote_names),
+                    error=str(exc),
                 )
-                all_failed.extend(failed)
+                all_failed.extend(remote_names)
+
+        # Wait for any in-flight parallel transfers.
+        for peer_name, remote_names, handle in in_flight:
+            try:
+                agent.wait_transfer(handle)
+            except (RuntimeError, TimeoutError) as exc:
+                log.warning(
+                    "nixl_peer_partial_failure",
+                    peer=peer_name,
+                    failed=len(remote_names),
+                    assigned=len(remote_names),
+                    error=str(exc),
+                )
+                all_failed.extend(remote_names)
 
         if all_failed:
             log.warning(
@@ -405,7 +496,7 @@ class LayercastModelLoader(BaseModelLoader):
             ):
                 return False
 
-        if not _verify_checksums_all(local_tensors, remote_manifest, "multi-peer"):
+        if not _verify_checksums_all(local_tensors, first_manifest, "multi-peer"):
             return False
 
         _log_transfer_stats(t_xfer, local_tensors, f"multi-peer({len(plan)})")
@@ -419,15 +510,7 @@ class LayercastModelLoader(BaseModelLoader):
         weight_files: list[str],
         tp_rank: int,
     ) -> None:
-        """Register loaded VRAM tensors with NIXL and publish metadata.
-
-        Sends the NIXL agent metadata and tensor address manifest as separate
-        protobuf fields to the daemon. The daemon stores them as a serialized
-        PeerNixlMd proto.
-
-        If tensors are already registered (e.g. from _try_nixl_load), we
-        skip re-registration to avoid the ~5s cost.
-        """
+        """Register VRAM tensors with NIXL and publish metadata to the server."""
         try:
             agent = self._ensure_nixl_agent(tp_rank)
         except Exception as exc:
@@ -487,8 +570,8 @@ class LayercastModelLoader(BaseModelLoader):
                 tensors=len(gpu_tensors),
                 rank=tp_rank,
             )
-            # Pin the backend + loop so GC can't close the IPC socket.
-            # The sidecar treats EOF as a crash and unadvertises immediately.
+            # Pin the backend + loop so GC can't close the gRPC channel.
+            # The heartbeat task needs the channel alive to re-register.
             global _BACKEND_KEEPALIVE  # noqa: PLW0603
             _BACKEND_KEEPALIVE = (loop, backend)
         except Exception as exc:
@@ -501,11 +584,11 @@ class LayercastModelLoader(BaseModelLoader):
     # Helpers
 
     def _get_backend_loop(self) -> asyncio.AbstractEventLoop:
-        """Get or create the dedicated event loop for backend IPC.
+        """Get or create the dedicated event loop for backend gRPC.
 
-        The DaemonClient's socket reader/writer are bound to a specific event
-        loop. vLLM may run its own event loop in the main thread later, so we
-        keep a dedicated loop to avoid "Future attached to a different loop".
+        The gRPC async channel is bound to a specific event loop. vLLM may
+        run its own event loop in the main thread later, so we keep a
+        dedicated loop to avoid "Future attached to a different loop".
         """
         if self._backend_loop is None or self._backend_loop.is_closed():
             self._backend_loop = asyncio.new_event_loop()
@@ -519,11 +602,14 @@ class LayercastModelLoader(BaseModelLoader):
         Returns a Prepared proto with files, peers, weight_map, and transfer_plan.
         Returns None if the backend is unavailable.
         """
+        timeout_env = os.environ.get("PEER_DISCOVERY_TIMEOUT")
+        timeout_s: int | None = int(timeout_env) if timeout_env is not None else None
+
         loop = self._get_backend_loop()
         try:
             backend = loop.run_until_complete(self._get_backend())
             prepared = loop.run_until_complete(
-                backend.prepare_model(repo_id, revision, tp_rank)
+                backend.prepare_model(repo_id, revision, tp_rank, timeout_s)
             )
             if prepared.files:
                 log.info(
@@ -632,26 +718,78 @@ class LayercastModelLoader(BaseModelLoader):
                 self._nixl_agent = agent
         return self._nixl_agent
 
-    async def _get_backend(self) -> RustSidecarBackend:
+    async def _get_backend(self) -> LayercastBackend:
         """Lazily create and connect the backend."""
         if self._backend is None:
-            socket_path = os.environ.get(
-                "LAYERCAST_SOCKET", "/var/run/layercast/daemon.sock"
+            server_addr = os.environ.get(
+                "LAYERCAST_SERVER_ADDR", "layercast-metadata-server:50051"
             )
-            self._backend = RustSidecarBackend(socket_path=socket_path)
+            self._backend = LayercastBackend(server_addr=server_addr)
             await self._backend.start()
         return self._backend
+
+
+def _pre_allocate_from_manifest(
+    remote_manifest: dict[str, TensorInfo],
+) -> dict[str, "torch.Tensor"]:
+    """Pre-allocate flat CUDA tensors matching remote sizes/dtypes.
+
+    Allocated tensors can be NIXL-registered immediately, then reshaped
+    to match model param shapes via _bind_pre_allocated after model init.
+    """
+    device = f"cuda:{torch.cuda.current_device()}"
+    tensors: dict[str, torch.Tensor] = {}
+    for name, info in remote_manifest.items():
+        dtype = _parse_torch_dtype(info.dtype or None, torch.bfloat16)
+        elem_size = _dtype_element_size(dtype)
+        n_elements = info.size // elem_size
+        tensors[name] = torch.empty(n_elements, dtype=dtype, device=device)
+    log.info("pre_allocated_from_manifest", count=len(tensors))
+    return tensors
+
+
+def _bind_pre_allocated(
+    model: nn.Module,
+    pre_allocated: dict[str, "torch.Tensor"],
+    remote_manifest: dict[str, TensorInfo],
+) -> None:
+    """Reshape flat pre-allocated tensors to match model params and bind them."""
+    bound = 0
+    for name, param in model.named_parameters():
+        if name not in pre_allocated:
+            continue
+        shaped = pre_allocated[name].reshape(param.shape)
+        param.data = shaped
+        pre_allocated[name] = shaped
+        bound += 1
+    log.info(
+        "pre_allocated_bound",
+        bound=bound,
+        model_params=sum(1 for _ in model.named_parameters()),
+    )
+
+
+def _dtype_element_size(dtype: "torch.dtype") -> int:
+    """Return element size in bytes for a torch dtype."""
+    return torch.tensor([], dtype=dtype).element_size()
 
 
 def _materialize_params(
     model: nn.Module,
     remote_manifest: dict[str, TensorInfo],
 ) -> dict[str, "torch.Tensor"]:
-    """Materialize meta-device params to CUDA, matching remote manifest dtypes."""
+    """Materialize meta-device params to CUDA, matching remote manifest dtypes.
+
+    Params already on CUDA (from _bind_pre_allocated) are returned as-is.
+    """
     device = f"cuda:{torch.cuda.current_device()}"
     local_tensors: dict[str, torch.Tensor] = {}
     for name, param in model.named_parameters():
         if name not in remote_manifest:
+            continue
+        if param.is_cuda:
+            # Already materialized (e.g. by _bind_pre_allocated)
+            local_tensors[name] = param.data
             continue
         remote_info = remote_manifest[name]
         dtype = _parse_torch_dtype(remote_info.dtype or None, param.dtype)
@@ -666,11 +804,13 @@ def _issue_and_wait_transfers(
     peer_name: str,
     remote_manifest: dict[str, TensorInfo],
     local_tensors: dict[str, "torch.Tensor"],
+    *,
+    skip_large_registration: bool = False,
 ) -> list[str]:
     """Issue NIXL reads and wait for completion. Returns names of failed tensors.
 
     Splits tensors into large (individual) and small (coalesced) transfers.
-    On failure, collects the tensor names that failed rather than aborting.
+    When skip_large_registration is True, large tensors are already registered.
     """
     device = f"cuda:{torch.cuda.current_device()}"
     large_tensors: dict[str, torch.Tensor] = {}
@@ -682,7 +822,8 @@ def _issue_and_wait_transfers(
         else:
             large_tensors[name] = tensor
 
-    agent.register_vram(large_tensors)
+    if not skip_large_registration:
+        agent.register_local_vram(large_tensors)
 
     handles: list[tuple[str | list[str], object]] = []
     failed: list[str] = []
@@ -691,7 +832,7 @@ def _issue_and_wait_transfers(
     if small_entries:
         total_small = sum(t.nelement() * t.element_size() for _, t in small_entries)
         coalesce_buf = torch.empty(total_small, dtype=torch.uint8, device=device)
-        agent.register_vram({"__coalesced__": coalesce_buf})
+        agent.register_local_vram({"__coalesced__": coalesce_buf})
 
         remote_regions: list[tuple[int, int, int]] = []
         offsets: list[int] = []

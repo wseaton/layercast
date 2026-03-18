@@ -1,21 +1,26 @@
-# Istio AuthorizationPolicy for model-mesh.
+# Istio AuthorizationPolicy for the metadata server.
 #
-# Port 8081 (NIXL metadata exchange): only layercast service accounts.
+# Port 50051 (gRPC): only layercast-managed pods.
+# Port 8081 (HTTP health/readyz): allow all (for k8s probes).
+# Port 6379 (RESP2 compile cache): only layercast-managed pods.
 ---
 apiVersion: security.istio.io/v1
 kind: AuthorizationPolicy
 metadata:
-  name: model-mesh-internal
+  name: layercast-metadata-server
   namespace: layercast
 spec:
   selector:
     matchLabels:
-      app: model-mesh
+      app: layercast-metadata-server
   action: ALLOW
   rules:
     - to:
         - operation:
-            ports: ["8081"]
+            ports: ["50051", "6379"]
       from:
         - source:
             principals: ["cluster.local/ns/layercast/sa/default"]
+    - to:
+        - operation:
+            ports: ["8081"]
