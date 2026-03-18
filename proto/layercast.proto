@@ -1,18 +1,11 @@
 syntax = "proto3";
 package layercast;
 
-// ── gRPC Service (central metadata server, unary RPCs) ────────────────
-//
-// Istio/Envoy-friendly: no long-lived bidirectional streams.
-// Crash protection handled by server-side Pod watcher, not stream EOF.
-
 service LayercastService {
   rpc PrepareModel(PrepareModelRequest) returns (PrepareModelResponse);
   rpc ModelLoaded(ModelLoadedRequest) returns (ModelLoadedResponse);
   rpc ModelUnloaded(ModelUnloadedRequest) returns (ModelUnloadedResponse);
 }
-
-// ── gRPC wrapper messages (include pod identity) ──────────────────────
 
 message PrepareModelRequest {
   string pod_name = 1;
@@ -45,8 +38,6 @@ message ModelUnloadedResponse {
   Ok ok = 1;
 }
 
-// ── IPC messages (used by both gRPC wrappers and legacy Unix socket) ──
-
 message IpcRequest {
   oneof msg {
     PrepareModel prepare_model = 1;
@@ -73,8 +64,6 @@ message ModelLoaded {
 message ModelUnloaded {
   string agent_name = 1;
 }
-
-// ── Responses (tagged union via oneof) ───────────────────────────────
 
 message IpcResponse {
   oneof msg {

@@ -71,5 +71,4 @@ class LayercastBackend:
         await client.model_unloaded(agent_name)
 
 
-# Keep the old name as an alias during migration
 RustSidecarBackend = LayercastBackend

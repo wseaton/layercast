@@ -1,8 +1,7 @@
 """Tests for the NIXL protobuf protocol.
 
-These tests verify the wire format and round-trip behavior WITHOUT
-requiring vLLM, NIXL, PyTorch, or real GPUs. All external deps are
-either mocked or not needed.
+Wire format and proto round-trip tests run everywhere.
+Tests that touch VramNixlAgent require nixl + torch (skipped in CI).
 """
 
 from __future__ import annotations
@@ -32,8 +31,17 @@ from vllm_layercast.proto import (
     encode,
 )
 
+try:
+    import torch  # noqa: F401
+    import vllm_layercast.nixl_agent as _nixl_mod  # noqa: F401
 
-# PeerNixlMd tests (structured proto, replaces compound msgpack)
+    _HAS_GPU_DEPS = True
+except Exception:
+    _HAS_GPU_DEPS = False
+
+requires_gpu_deps = pytest.mark.skipif(
+    not _HAS_GPU_DEPS, reason="gpu deps not installed"
+)
 
 
 class TestPeerNixlMd:
@@ -116,9 +124,6 @@ class TestPeerNixlMd:
         assert remote_manifest["embed.weight"].addr == 100
         assert remote_manifest["embed.weight"].size == 1000
         assert remote_manifest["lm_head.weight"].device_id == 1
-
-
-# IPC wire format tests (state machine messages)
 
 
 class TestIpcWireFormat:
@@ -430,6 +435,7 @@ class TestTensorInfo:
 # wait_transfer tests
 
 
+@requires_gpu_deps
 class TestWaitTransfer:
     """Test VramNixlAgent.wait_transfer polling, error detection, and timeout."""
 
@@ -487,6 +493,7 @@ class TestWaitTransfer:
 # register_local_vram tests
 
 
+@requires_gpu_deps
 class TestRegisterLocalVram:
     """Test VramNixlAgent.register_local_vram for receive-side registration.
 
@@ -601,6 +608,7 @@ class TestRegisterLocalVram:
 # register_vram(checksums=False) + finalize_manifest tests
 
 
+@requires_gpu_deps
 class TestRegisterVramEarly:
     """Test the register-once optimization: register_vram(checksums=False) + finalize_manifest."""
 

@@ -139,7 +139,7 @@ class LayercastModelLoader(BaseModelLoader):
                 "weights_loaded", method="hf_default", elapsed_s=elapsed, model=repo_id
             )
 
-        # register VRAM with the daemon so we can serve peers
+        # publish VRAM so future peers can NIXL-load from us
         self._publish_vram(model, repo_id, revision, weight_files, tp_rank)
 
     def load_model(
