@@ -46,7 +46,7 @@ except ImportError:
 from huggingface_hub import try_to_load_from_cache  # noqa: E402
 from safetensors import safe_open  # noqa: E402
 
-from vllm_layercast.backend_rust import LayercastBackend  # noqa: E402
+from vllm_layercast.backend import LayercastBackend  # noqa: E402
 from vllm_layercast.checksum import is_enabled as _checksum_enabled  # noqa: E402
 from vllm_layercast.checksum import verify_checksums  # noqa: E402
 from vllm_layercast.nixl_agent import VramNixlAgent, _COALESCE_THRESHOLD  # noqa: E402

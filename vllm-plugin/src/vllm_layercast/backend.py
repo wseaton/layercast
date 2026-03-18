@@ -69,6 +69,3 @@ class LayercastBackend:
     async def model_unloaded(self, agent_name: str) -> None:
         client = self._ensure_client()
         await client.model_unloaded(agent_name)
-
-
-RustSidecarBackend = LayercastBackend

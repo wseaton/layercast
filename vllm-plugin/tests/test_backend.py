@@ -12,7 +12,7 @@ from concurrent import futures
 import grpc
 import pytest
 
-from vllm_layercast.backend_rust import LayercastBackend
+from vllm_layercast.backend import LayercastBackend
 from vllm_layercast.pb.layercast import (
     ModelLoadedRequest,
     ModelLoadedResponse,
